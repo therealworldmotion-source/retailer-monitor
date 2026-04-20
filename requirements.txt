@@ -1,4 +1,5 @@
 patchright>=1.58.0
 httpx>=0.27.0
+brotli>=1.1.0
 beautifulsoup4>=4.12.3
 lxml>=5.1.0

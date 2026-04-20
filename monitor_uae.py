@@ -83,6 +83,7 @@ def _config_from_env() -> dict | None:
             "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
             "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
+            "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
