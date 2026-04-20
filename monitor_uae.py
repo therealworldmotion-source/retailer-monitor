@@ -13,6 +13,7 @@ Sites monitored:
 import asyncio
 import json
 import logging
+import os
 import platform
 import random
 import re
@@ -23,23 +24,95 @@ import httpx
 from bs4 import BeautifulSoup
 from patchright.async_api import BrowserContext, async_playwright
 
+
+def _default_chrome_path() -> str | None:
+    """Resolve real Chrome path per OS. Returns None on Linux if Chrome isn't installed —
+    callers then fall back to patchright's bundled Chromium."""
+    override = os.environ.get("CHROME_PATH")
+    if override:
+        return override
+    system = platform.system()
+    if system == "Darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if system == "Windows":
+        return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    # Linux (Docker / Railway): prefer /usr/bin/google-chrome if present
+    for candidate in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
 # Real Chrome path — needed for sites that block Patchright's bundled Chromium (e.g. Geekay/Cloudflare, Smyths/Incapsula)
-CHROME_PATH = (
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    if platform.system() == "Darwin"
-    else "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-)
+CHROME_PATH = _default_chrome_path()
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
+# DATA_DIR lets Railway mount a persistent volume (e.g. /data) so state survives redeploys.
+DATA_DIR    = Path(os.environ.get("DATA_DIR", "."))
 CONFIG_FILE = Path("config_uae.json")
-STATE_FILE  = Path("state_uae.json")
+STATE_FILE  = DATA_DIR / "state_uae.json"
+
+# Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
+DISABLED_RETAILERS = {
+    s.strip().lower() for s in os.environ.get("DISABLED_RETAILERS", "").split(",") if s.strip()
+}
+
+
+def _config_from_env() -> dict | None:
+    """Build a config dict from environment variables (Railway / container deploys).
+    Returns None if the required Telegram vars are missing."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat  = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return None
+    cfg: dict = {
+        "telegram_bot_token": token,
+        "telegram_chat_id": chat,
+        "intervals": {
+            "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
+            "colorland_toys": 180, "magrudy": 60, "zgames": 60,
+            "geekay": 120, "little_things": 30,
+        },
+        "urls": {
+            "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
+            "virgin_megastore": "https://www.virginmegastore.ae/en/selection/general-merchandise/pokemon-merchandise/pokemon-tcg/c/n9992162",
+            "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
+            "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
+            "magrudy": "https://www.magrudy.com/search?q=tcg",
+            "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
+            "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
+            "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
+        },
+    }
+    if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
+        cfg["legends_auto_checkout"] = {
+            "enabled": True,
+            "watchlist": [s.strip() for s in os.environ.get("LEGENDS_WATCHLIST", "").split(";") if s.strip()],
+            "checkout_details": {
+                "email":   os.environ.get("CHECKOUT_EMAIL", ""),
+                "name":    os.environ.get("CHECKOUT_NAME", ""),
+                "phone":   os.environ.get("CHECKOUT_PHONE", ""),
+                "address": os.environ.get("CHECKOUT_ADDRESS", ""),
+                "city":    os.environ.get("CHECKOUT_CITY", ""),
+                "state":   os.environ.get("CHECKOUT_STATE", ""),
+                "zip":     os.environ.get("CHECKOUT_ZIP", ""),
+            },
+        }
+    return cfg
 
 
 def load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError("config_uae.json not found. Run setup first.")
-    return json.loads(CONFIG_FILE.read_text())
+    # Local file takes precedence (existing dev workflow unchanged).
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    # Fallback: build from env (Railway / Docker / CI).
+    env_cfg = _config_from_env()
+    if env_cfg is not None:
+        return env_cfg
+    raise FileNotFoundError(
+        "config_uae.json not found and TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars not set."
+    )
 
 
 CFG                 = load_config()
