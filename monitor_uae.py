@@ -1465,12 +1465,27 @@ async def make_browser_context(browser):
     return ctx
 
 
+async def launch_headless_browser(pw):
+    return await pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-accelerated-2d-canvas",
+            "--no-first-run",
+            "--no-zygote",
+            "--disable-gpu",
+        ],
+    )
+
+
 # ─── MONITOR LOOP ─────────────────────────────────────────────────────────────
 
 BROWSER_REFRESH_INTERVAL = 3_600  # Rotate browser context every hour
 
 
-async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser) -> None:
+async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw) -> None:
     """The core monitoring loop — runs until cancelled."""
     state = load_state()
 
@@ -1578,7 +1593,16 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser) -> 
                     await headless_context.close()
                 except Exception:
                     pass
-                headless_context = await make_browser_context(headless_browser)
+                try:
+                    headless_context = await make_browser_context(headless_browser)
+                except Exception as exc:
+                    log.warning("new_context failed (%s); relaunching headless browser", exc)
+                    try:
+                        await headless_browser.close()
+                    except Exception:
+                        pass
+                    headless_browser = await launch_headless_browser(pw)
+                    headless_context = await make_browser_context(headless_browser)
                 last_ctx_refresh = now
                 log.info("Browser context rotated")
 
@@ -1619,7 +1643,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser) -> 
                 headless_tasks.append(("otakume", check_otakume(state, client)))
                 last_otakume = now
 
-            if now - last_virgin >= INTERVALS["virgin_megastore"]:
+            if "virgin_megastore" not in DISABLED_RETAILERS and now - last_virgin >= INTERVALS["virgin_megastore"]:
                 headless_tasks.append(("virgin_megastore", check_virgin_megastore(state, client, headless_context)))
                 last_virgin = now
 
@@ -1635,7 +1659,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser) -> 
                 headless_tasks.append(("magrudy", check_magrudy(state, client)))
                 last_magrudy = now
 
-            if now - last_zgames >= INTERVALS.get("zgames", 180):
+            if "zgames" not in DISABLED_RETAILERS and now - last_zgames >= INTERVALS.get("zgames", 180):
                 headless_tasks.append(("zgames", check_zgames(state, client, headless_context)))
                 last_zgames = now
 
@@ -1682,7 +1706,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser) -> 
 
 # ─── TELEGRAM COMMAND LISTENER ────────────────────────────────────────────────
 
-async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser) -> None:
+async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser, pw) -> None:
     """
     Listens for Telegram messages from the authorised chat.
     Responds to:
@@ -1724,7 +1748,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                     await send_telegram("⚠️ Monitor is already running.", client)
                 else:
                     HEARTBEAT["last"] = 0.0   # reset before new run
-                    monitor_task  = asyncio.create_task(monitor_loop(client, browser, headless_browser))
+                    monitor_task  = asyncio.create_task(monitor_loop(client, browser, headless_browser, pw))
                     watchdog_task = asyncio.create_task(run_watchdog(monitor_task, client))
                     await send_telegram(
                         "✅ <b>UAE Retailer Monitor started!</b>\n\n"
@@ -1781,21 +1805,10 @@ async def main() -> None:
         follow_redirects=True,
     ) as client:
         async with async_playwright() as pw:
-            headless_browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-zygote",
-                    "--disable-gpu",
-                ],
-            )
+            headless_browser = await launch_headless_browser(pw)
 
             try:
-                await telegram_listener(client, None, headless_browser)
+                await telegram_listener(client, None, headless_browser, pw)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log.info("Shutting down")
             finally:
