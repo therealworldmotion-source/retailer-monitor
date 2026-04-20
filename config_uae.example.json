@@ -1,0 +1,41 @@
+{
+  "telegram_bot_token": "YOUR_UAE_BOT_TOKEN",
+  "telegram_chat_id": "YOUR_CHAT_ID",
+  "intervals": {
+    "otakume": 60,
+    "virgin_megastore": 60,
+    "legends_own_the_game": 60,
+    "colorland_toys": 180,
+    "magrudy": 60,
+    "zgames": 60,
+    "geekay": 120,
+    "little_things": 30
+  },
+  "urls": {
+    "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
+    "virgin_megastore": "https://www.virginmegastore.ae/en/selection/general-merchandise/pokemon-merchandise/pokemon-tcg/c/n9992162",
+    "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
+    "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
+    "magrudy": "https://www.magrudy.com/search?q=tcg",
+    "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
+    "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
+    "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250"
+  },
+  "legends_auto_checkout": {
+    "enabled": true,
+    "watchlist": [
+      "Ascended Heroes Pin Collection",
+      "First Partner Booster Collection",
+      "Ascended Heroes P.Poster Collection"
+    ],
+    "checkout_details": {
+      "email": "chadsteven1103@gmail.com",
+      "name": "Jas Singh",
+      "phone": "+447720240781",
+      "address": "203 Al Heem",
+      "city": "Khalifa City",
+      "state": "Abu Dhabi",
+      "zip": ""
+    }
+  }
+}

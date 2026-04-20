@@ -1,0 +1,26 @@
+config_uk.json
+config_uae.json
+config.json
+state_uk.json
+state_uae.json
+state.json
+*.log
+out.txt
+err.txt
+uae_out.txt
+uae_err.txt
+__pycache__/
+*.pyc
+
+# Deploy / environment
+.env
+.env.*
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+
+# Playwright / Patchright caches
+.cache/
+playwright-report/

@@ -1,0 +1,24 @@
+{
+  "telegram_bot_token": "YOUR_UK_BOT_TOKEN",
+  "telegram_chat_id": "YOUR_CHAT_ID",
+  "intervals": {
+    "menkind": 120,
+    "game": 120,
+    "currys": 120,
+    "john_lewis": 120,
+    "freemans": 60,
+    "asda": 120,
+    "very": 120,
+    "selfridges": 120
+  },
+  "urls": {
+    "menkind": "https://www.menkind.co.uk/search.php?BigCommerceX%5Bquery%5D=pokemon+TCG",
+    "game": "https://www.game.co.uk/pokemon/trading-cards",
+    "currys": "https://www.currys.co.uk/gaming/gaming-accessories/gaming-merchandise/pokemon/trading-cards",
+    "john_lewis": "https://www.johnlewis.com/search?search-term=pokemon%20trading%20card",
+    "freemans": "https://www.freemans.com/search/_/N-1c?searchType=FullText&Nty=1&Ntt=pokemon+tcg",
+    "asda": "https://direct.asda.com/george/clothing/10,default,sc.html?q=pokemon%20tcg",
+    "very": "https://www.very.co.uk/search/pokemon-tcg",
+    "selfridges": "https://www.selfridges.com/GB/en/cat/?freeText=pokemon%20tcg&srch=Y"
+  }
+}
