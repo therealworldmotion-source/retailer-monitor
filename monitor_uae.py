@@ -1588,6 +1588,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             HEARTBEAT["last"] = now          # feed the watchdog
 
             # ── Rotate browser context hourly ──────────────────────────────
+            # The relaunch path must be wrapped too: if the patchright driver
+            # itself is dead (not just the browser), launch_headless_browser
+            # or the second new_context call will raise the same error. Let
+            # that propagate and the watchdog fires "Monitor crashed!".
             if now - last_ctx_refresh >= BROWSER_REFRESH_INTERVAL:
                 try:
                     await headless_context.close()
@@ -1595,19 +1599,28 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                     pass
                 try:
                     headless_context = await make_browser_context(headless_browser)
+                    last_ctx_refresh = now
+                    log.info("Browser context rotated")
                 except Exception as exc:
                     log.warning("new_context failed (%s); relaunching headless browser", exc)
                     try:
                         await headless_browser.close()
                     except Exception:
                         pass
-                    headless_browser = await launch_headless_browser(pw)
-                    headless_context = await make_browser_context(headless_browser)
-                last_ctx_refresh = now
-                log.info("Browser context rotated")
+                    try:
+                        headless_browser = await launch_headless_browser(pw)
+                        headless_context = await make_browser_context(headless_browser)
+                        last_ctx_refresh = now
+                        log.info("Headless browser relaunched and context created")
+                    except Exception as exc2:
+                        # Driver is likely dead too; skip rotation and retry next hour.
+                        # Headless-context checks will fail until then, but the loop
+                        # survives — no watchdog crash alert.
+                        log.error("Browser relaunch failed: %s; will retry next rotation", exc2)
+                        last_ctx_refresh = now
 
             # ════ PRIORITY: LITTLE THINGS — runs first, every 30s ══════════
-            if now - last_little_things >= INTERVALS.get("little_things", 30):
+            if "little_things" not in DISABLED_RETAILERS and now - last_little_things >= INTERVALS.get("little_things", 30):
                 try:
                     state = await check_little_things(state, client)
                     _mark("little_things", bool(state.get("little_things")))
@@ -1621,7 +1634,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 last_little_things = now
 
             # ════ PRIORITY: LITTLE THINGS ONE PIECE — runs first, every 30s ══
-            if now - last_little_things_op >= INTERVALS.get("little_things", 30):
+            if "little_things_onepiece" not in DISABLED_RETAILERS and now - last_little_things_op >= INTERVALS.get("little_things", 30):
                 try:
                     state = await check_little_things_onepiece(state, client)
                     _mark("little_things_onepiece", bool(state.get("little_things_onepiece")))
@@ -1639,7 +1652,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
             headless_tasks = []
 
-            if now - last_otakume >= INTERVALS["otakume"]:
+            if "otakume" not in DISABLED_RETAILERS and now - last_otakume >= INTERVALS["otakume"]:
                 headless_tasks.append(("otakume", check_otakume(state, client)))
                 last_otakume = now
 
@@ -1647,15 +1660,15 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("virgin_megastore", check_virgin_megastore(state, client, headless_context)))
                 last_virgin = now
 
-            if now - last_legends >= INTERVALS["legends_own_the_game"]:
+            if "legends_own_the_game" not in DISABLED_RETAILERS and now - last_legends >= INTERVALS["legends_own_the_game"]:
                 headless_tasks.append(("legends_own_the_game", check_legends_own_the_game(state, client)))
                 last_legends = now
 
-            if now - last_colorland >= INTERVALS.get("colorland_toys", 180):
+            if "colorland_toys" not in DISABLED_RETAILERS and now - last_colorland >= INTERVALS.get("colorland_toys", 180):
                 headless_tasks.append(("colorland_toys", check_colorland_toys(state, client)))
                 last_colorland = now
 
-            if now - last_magrudy >= INTERVALS.get("magrudy", 180):
+            if "magrudy" not in DISABLED_RETAILERS and now - last_magrudy >= INTERVALS.get("magrudy", 180):
                 headless_tasks.append(("magrudy", check_magrudy(state, client)))
                 last_magrudy = now
 
