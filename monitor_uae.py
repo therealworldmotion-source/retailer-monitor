@@ -498,14 +498,20 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
+        # Warm up cookies by hitting the homepage first — Virgin's anti-bot
+        # layer 403s cold requests straight to category pages.
+        try:
+            await client.get(
+                "https://www.virginmegastore.ae/en/",
+                headers=get_headers(),
+                timeout=15,
+            )
+        except Exception:
+            pass  # best-effort; the real request still carries whatever cookies we got
+
         resp = await client.get(
             URLS["virgin_megastore"],
-            headers={
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-GB,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-            },
+            headers=get_headers("https://www.virginmegastore.ae/en/"),
             timeout=25,
         )
 
