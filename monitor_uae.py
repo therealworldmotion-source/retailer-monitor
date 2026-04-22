@@ -491,29 +491,40 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 # ─── VIRGIN MEGASTORE ─────────────────────────────────────────────────────────
 
 async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict:
-    """Virgin Megastore — plain HTTP scrape. The product grid is server-rendered,
-    so no headless browser is required. Previous Chromium-based approach kept
-    OOM-crashing on Railway and silently froze state."""
+    """Virgin Megastore — SAP Hybris, product grid is server-rendered.
+
+    Uses curl_cffi (impersonating Chrome's TLS fingerprint) instead of httpx:
+    httpx on Railway's datacenter IP gets 403 because Cloudflare can tell it's
+    Python from the TLS handshake alone. curl_cffi sends a ClientHello
+    indistinguishable from real Chrome, which bypasses Virgin's anti-bot layer
+    from the same IP that httpx can't get through. The `client` param is
+    retained for Telegram calls and compatibility with the dispatch loop."""
     log.info("Checking Virgin Megastore...")
+
+    # Lazy import — isolates the dependency and keeps the file importable even
+    # if curl_cffi isn't installed yet (first Railway deploy with new reqs).
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc)
+        raise
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        # Warm up cookies by hitting the homepage first — Virgin's anti-bot
-        # layer 403s cold requests straight to category pages.
-        try:
-            await client.get(
-                "https://www.virginmegastore.ae/en/",
-                headers=get_headers(),
-                timeout=15,
-            )
-        except Exception:
-            pass  # best-effort; the real request still carries whatever cookies we got
 
-        resp = await client.get(
-            URLS["virgin_megastore"],
-            headers=get_headers("https://www.virginmegastore.ae/en/"),
-            timeout=25,
-        )
+        async with AsyncSession(impersonate="chrome") as cf:
+            # Warm up cookies by hitting the homepage first; Cloudflare sets
+            # session cookies on the first visit that are required on deep links.
+            try:
+                await cf.get("https://www.virginmegastore.ae/en/", timeout=15)
+            except Exception:
+                pass  # best-effort; the real request still carries what we got
+
+            resp = await cf.get(
+                URLS["virgin_megastore"],
+                headers={"Referer": "https://www.virginmegastore.ae/en/"},
+                timeout=25,
+            )
 
         if resp.status_code != 200:
             log.warning("Virgin Megastore returned HTTP %s", resp.status_code)
