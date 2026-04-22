@@ -490,19 +490,30 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
 # ─── VIRGIN MEGASTORE ─────────────────────────────────────────────────────────
 
-async def check_virgin_megastore(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
+async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict:
+    """Virgin Megastore — plain HTTP scrape. The product grid is server-rendered,
+    so no headless browser is required. Previous Chromium-based approach kept
+    OOM-crashing on Railway and silently froze state."""
     log.info("Checking Virgin Megastore...")
-    page = None
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        page = await context.new_page()
+        resp = await client.get(
+            URLS["virgin_megastore"],
+            headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+            },
+            timeout=25,
+        )
 
-        await page.goto(URLS["virgin_megastore"], wait_until="domcontentloaded", timeout=35_000)
-        await asyncio.sleep(random.uniform(2, 4))
+        if resp.status_code != 200:
+            log.warning("Virgin Megastore returned HTTP %s", resp.status_code)
+            raise RuntimeError(f"HTTP {resp.status_code}")
 
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
         current: dict[str, dict] = {}
 
         for item in soup.select(".product-item"):
@@ -531,7 +542,9 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient, context
 
         if not current:
             log.warning("Virgin Megastore: no products found — selectors may need updating")
-            return state
+            raise RuntimeError("no products parsed")
+
+        log.info("Virgin Megastore: %d products found", len(current))
 
         prev      = state.get("virgin_megastore", {})
         first_run = len(prev) == 0
@@ -580,9 +593,7 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient, context
 
     except Exception as exc:
         log.error("Virgin Megastore check failed: %s", exc)
-    finally:
-        if page:
-            await page.close()
+        raise
 
     return state
 
@@ -1657,7 +1668,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 last_otakume = now
 
             if "virgin_megastore" not in DISABLED_RETAILERS and now - last_virgin >= INTERVALS["virgin_megastore"]:
-                headless_tasks.append(("virgin_megastore", check_virgin_megastore(state, client, headless_context)))
+                headless_tasks.append(("virgin_megastore", check_virgin_megastore(state, client)))
                 last_virgin = now
 
             if "legends_own_the_game" not in DISABLED_RETAILERS and now - last_legends >= INTERVALS["legends_own_the_game"]:
