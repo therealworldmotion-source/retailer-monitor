@@ -100,6 +100,11 @@ def _config_from_env() -> dict | None:
                 "zip":     os.environ.get("CHECKOUT_ZIP", ""),
             },
         }
+    if os.environ.get("LITTLETHINGS_AUTO_CART", "").lower() == "true":
+        cfg["littlethings_auto_cart"] = {
+            "enabled": True,
+            "watchlist": [s.strip() for s in os.environ.get("LITTLETHINGS_WATCHLIST", "").split(";") if s.strip()],
+        }
     return cfg
 
 
@@ -1307,10 +1312,19 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                 variants = p.get("variants", [{}])
                 v = variants[0] if variants else {}
                 available = any(var.get("available") for var in variants)
+                # Pick the first available variant for cart URLs (fall back to v[0])
+                avail_variant = next((var for var in variants if var.get("available")), v)
+                variant_id = avail_variant.get("id") or v.get("id")
                 price_raw = v.get("price", "0")
                 price = f"AED {price_raw}"
                 prod_url = f"https://littlethingsme.com/products/{handle}"
-                current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
+                current[handle] = {
+                    "title": title,
+                    "url": prod_url,
+                    "price": price,
+                    "available": available,
+                    "variant_id": variant_id,
+                }
 
             if len(products) < 250:
                 break
@@ -1337,6 +1351,28 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                 lines.append("\n❌ Nothing currently in stock")
             await send_telegram("\n".join(lines), client)
             log.info("Little Things: baseline sent (%d products)", len(current))
+
+            # Auto-cart on baseline if watchlist items are already in stock
+            auto_cfg = CFG.get("littlethings_auto_cart", {})
+            if auto_cfg.get("enabled"):
+                watchlist = [w.lower() for w in auto_cfg.get("watchlist", []) if w]
+                cart_hits = [
+                    p for p in current.values()
+                    if p.get("available")
+                    and p.get("variant_id")
+                    and any(w in p["title"].lower() for w in watchlist)
+                ]
+                if cart_hits:
+                    log.info("Little Things auto-cart (baseline): %d watchlist match(es)", len(cart_hits))
+                    pairs = ",".join(f"{p['variant_id']}:1" for p in cart_hits)
+                    cart_url = f"https://littlethingsme.com/cart/{pairs}"
+                    names = "\n".join(f"  🛒 {p['title']} — {p['price']}" for p in cart_hits)
+                    await send_telegram(
+                        f"<b>🚨 LITTLE THINGS — WATCHLIST IN STOCK — TAP TO CHECKOUT!</b>\n\n"
+                        f"{names}\n\n"
+                        f'<a href="{cart_url}">👉 Open pre-filled cart</a>',
+                        client,
+                    )
         else:
             new_products, restocked, went_oos = [], [], []
             for pid, prod in current.items():
@@ -1358,6 +1394,31 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+
+            # ── Auto-cart: build a Shopify cart permalink for watchlist hits ──
+            auto_cfg = CFG.get("littlethings_auto_cart", {})
+            if auto_cfg.get("enabled"):
+                watchlist = [w.lower() for w in auto_cfg.get("watchlist", []) if w]
+                cart_hits = []
+                for p in (new_products + restocked):
+                    if (
+                        p.get("available")
+                        and p.get("variant_id")
+                        and any(w in p["title"].lower() for w in watchlist)
+                    ):
+                        cart_hits.append(p)
+                if cart_hits:
+                    log.info("Little Things auto-cart: %d watchlist match(es)", len(cart_hits))
+                    pairs = ",".join(f"{p['variant_id']}:1" for p in cart_hits)
+                    cart_url = f"https://littlethingsme.com/cart/{pairs}"
+                    names = "\n".join(f"  🛒 {p['title']} — {p['price']}" for p in cart_hits)
+                    await send_telegram(
+                        f"<b>🚨 LITTLE THINGS — WATCHLIST HIT — TAP TO CHECKOUT!</b>\n\n"
+                        f"{names}\n\n"
+                        f'<a href="{cart_url}">👉 Open pre-filled cart</a>',
+                        client,
+                    )
+
             if went_oos:
                 log.info("Little Things: %d went OOS (not alerting)", len(went_oos))
             if not (new_products or restocked):
@@ -1400,10 +1461,19 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
                 variants = p.get("variants", [{}])
                 v = variants[0] if variants else {}
                 available = any(var.get("available") for var in variants)
+                # Pick the first available variant for cart URLs (fall back to v[0])
+                avail_variant = next((var for var in variants if var.get("available")), v)
+                variant_id = avail_variant.get("id") or v.get("id")
                 price_raw = v.get("price", "0")
                 price = f"AED {price_raw}"
                 prod_url = f"https://littlethingsme.com/products/{handle}"
-                current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
+                current[handle] = {
+                    "title": title,
+                    "url": prod_url,
+                    "price": price,
+                    "available": available,
+                    "variant_id": variant_id,
+                }
 
             if len(products) < 250:
                 break
