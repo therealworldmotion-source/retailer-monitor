@@ -72,7 +72,7 @@ def _config_from_env() -> dict | None:
         "intervals": {
             "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
-            "geekay": 120, "little_things": 30,
+            "geekay": 120, "little_things": 30, "toycorner": 180,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -84,6 +84,7 @@ def _config_from_env() -> dict | None:
             "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
+            "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -203,6 +204,7 @@ def load_state() -> dict:
         "zgames":               {},
         "geekay":               {},
         "little_things":        {},
+        "toycorner":            {},
     }
 
 
@@ -970,6 +972,149 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+# ─── TOY CORNER ───────────────────────────────────────────────────────────────
+
+async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
+    """Toy Corner — WooCommerce store, server-rendered HTML.
+    Parses the Pokemon trading cards category page; paginates via /page/N/."""
+    log.info("Checking Toy Corner...")
+    current: dict[str, dict] = {}
+
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        base_url    = URLS["toycorner"]
+        page_num    = 1
+        fetch_error = False
+        max_pages   = 12  # safety cap
+        while page_num <= max_pages:
+            url = base_url if page_num == 1 else f"{base_url.rstrip('/')}/page/{page_num}/"
+            resp = await client.get(
+                url,
+                headers=get_headers("https://toycorner.ae/"),
+                timeout=25,
+                follow_redirects=True,
+            )
+            if resp.status_code == 404 and page_num > 1:
+                break  # past last page
+            if resp.status_code == 429:
+                log.warning("Toy Corner: rate limited on page %d — waiting 30s and retrying", page_num)
+                await asyncio.sleep(30)
+                resp = await client.get(url, headers=get_headers("https://toycorner.ae/"), timeout=25, follow_redirects=True)
+            if resp.status_code != 200:
+                log.warning("Toy Corner: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
+                fetch_error = True
+                break
+
+            soup  = BeautifulSoup(resp.text, "html.parser")
+            items = soup.find_all(attrs={"class": lambda c: c and "type-product" in c})
+            log.info("Toy Corner: page %d — %d items", page_num, len(items))
+
+            if not items:
+                break
+
+            for item in items:
+                classes = " ".join(item.get("class", []))
+                pid_m   = re.search(r"post-(\d+)", classes)
+                if not pid_m:
+                    continue
+                pid       = pid_m.group(1)
+                available = ("instock" in classes) and ("outofstock" not in classes)
+
+                # Title
+                title_el = item.select_one(".product-title") or item.select_one("h2") or item.select_one("h3")
+                title    = title_el.get_text(strip=True) if title_el else ""
+                if not title:
+                    img = item.find("img")
+                    title = (img.get("alt") if img else "") or ""
+                if not title or len(title) < 3:
+                    continue
+
+                # URL
+                a = item.find("a", href=re.compile(r"/product/"))
+                prod_url = a["href"] if a else f"https://toycorner.ae/?p={pid}"
+
+                # Price — prefer <ins> (sale price), else first .woocommerce-Price-amount
+                pr_el  = item.select_one(".price")
+                price  = "N/A"
+                if pr_el:
+                    target  = pr_el.find("ins") or pr_el
+                    amt_el  = target.select_one(".woocommerce-Price-amount bdi") or target.select_one(".woocommerce-Price-amount")
+                    if amt_el:
+                        price = f"AED {amt_el.get_text(strip=True)}"
+
+                current[pid] = {"title": title, "url": prod_url, "price": price, "available": available}
+
+            if len(items) < 12:
+                break  # last page (default WooCommerce page size)
+            page_num += 1
+            await asyncio.sleep(random.uniform(3, 6))
+
+        if fetch_error:
+            log.warning("Toy Corner: pagination error — state not updated")
+            return state
+
+        if not current:
+            log.warning("Toy Corner: no products found — selectors may have changed")
+            return state
+
+        log.info("Toy Corner: %d products found across %d page(s)", len(current), page_num)
+
+        prev      = state.get("toycorner", {})
+        first_run = len(prev) == 0
+
+        # Send startup summary on first check of each session
+        if first_run or not state.get("_toycorner_startup_sent"):
+            in_stock  = [v for v in current.values() if v["available"]]
+            out_stock = [v for v in current.values() if not v["available"]]
+            lines = [f"<b>🧸 TOY CORNER — Monitoring {'Started' if first_run else 'Resumed'} ({len(current)} products)</b>"]
+            if in_stock:
+                lines.append("\n✅ <b>In Stock:</b>")
+                for p in in_stock[:20]:
+                    lines.append(fmt_product(p))
+                if len(in_stock) > 20:
+                    lines.append(f"  ...and {len(in_stock) - 20} more in stock")
+            if out_stock:
+                lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)} product(s)")
+            await send_telegram("\n".join(lines), client)
+            state["_toycorner_startup_sent"] = True
+            log.info("Toy Corner: baseline sent (%d products)", len(current))
+        else:
+            new_products, restocked, went_oos = [], [], []
+            for pid, prod in current.items():
+                if pid not in prev:
+                    new_products.append(prod)
+                elif prod["available"] != prev[pid]["available"]:
+                    (restocked if prod["available"] else went_oos).append(prod)
+
+            if new_products:
+                lines = [f"<b>🆕 TOY CORNER — {len(new_products)} New Product(s)!</b>"]
+                for p in new_products:
+                    lines.append(fmt_product(p))
+                await send_telegram("\n".join(lines), client)
+            if restocked:
+                lines = ["<b>🟢 TOY CORNER — Back In Stock!</b>"]
+                for p in restocked:
+                    lines.append(fmt_product(p, "✅"))
+                await send_telegram("\n".join(lines), client)
+            if went_oos:
+                lines = ["<b>🔴 TOY CORNER — Out of Stock</b>"]
+                for p in went_oos:
+                    lines.append(fmt_product(p, "❌"))
+                await send_telegram("\n".join(lines), client)
+            if not (new_products or restocked or went_oos):
+                log.info("Toy Corner: no changes")
+
+        # Merge so transient pagination flickers don't re-alert
+        merged = state.get("toycorner", {})
+        merged.update(current)
+        state["toycorner"] = merged
+
+    except Exception as exc:
+        log.error("Toy Corner check failed: %s", exc)
+
+    return state
+
+
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -1599,6 +1744,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     state["geekay"]               = {}
     state["little_things"]        = {}
     state["little_things_onepiece"] = {}
+    # Don't wipe toycorner — pagination causes products to flicker in/out
+    state["_toycorner_startup_sent"] = False
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -1612,10 +1759,11 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "geekay":               {"label": "🛒 Geekay",               "ok": None, "time": ""},
         "little_things":        {"label": "🛍️ Little Things",        "ok": None, "time": ""},
         "little_things_onepiece": {"label": "🏴‍☠️ Little Things (OP)", "ok": None, "time": ""},
+        "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner"}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -1672,7 +1820,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = 0.0
+    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = 0.0
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -1774,6 +1922,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("zgames", check_zgames(state, client, headless_context)))
                 last_zgames = now
 
+            if "toycorner" not in DISABLED_RETAILERS and now - last_toycorner >= INTERVALS.get("toycorner", 180):
+                headless_tasks.append(("toycorner", check_toycorner(state, client)))
+                last_toycorner = now
+
             if headless_tasks:
                 log.info("Running %d headless checks concurrently...", len(headless_tasks))
                 results = await asyncio.gather(*[t[1] for t in headless_tasks], return_exceptions=True)
@@ -1870,7 +2022,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"📚 Magrudy: every {INTERVALS['magrudy'] // 60} min\n"
                         f"🕹️ ZGames: every {INTERVALS['zgames'] // 60} min\n"
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
-                        f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n\n"
+                        f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
+                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n\n"
                         "Send <code>stop</code> to pause.",
                         client,
                     )
