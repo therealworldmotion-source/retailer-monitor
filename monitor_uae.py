@@ -73,7 +73,6 @@ def _config_from_env() -> dict | None:
             "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "smyths": 300,  # 5 min — Imperva is strict
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -86,7 +85,6 @@ def _config_from_env() -> dict | None:
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
             "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
-            "smyths": "https://www.smythstoys.com/uk/en-gb/brand/pokemon/pokemon-trading-card-game/pokemon-trading-card-game-tcg-mega-evolution-ascended-heroes-booster-bundle/p/257185",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -1117,167 +1115,6 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
-# ─── SMYTHS TOYS (UK) — Single product, per-store stock ───────────────────────
-
-# Hardcoded for now — Pokemon Mega Evolution Ascended Heroes Booster Bundle.
-# Per-store target: SLOUGH (postcode SL2 1EX).
-SMYTHS_PRODUCT_CODE = "257185"
-SMYTHS_PRODUCT_NAME = "Pokémon TCG: Mega Evolution Ascended Heroes Booster Bundle"
-SMYTHS_POSTCODE     = "SL2 1EX"
-SMYTHS_TARGET_STORE = "slough"  # case-insensitive substring match against returned store names
-
-async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
-    """Smyths Toys UK — single-product tracker for a specific store.
-
-    Tracks online stock + in-store stock at SLOUGH for the Ascended Heroes
-    Booster Bundle. Smyths is behind Imperva so we drive a real headless
-    browser, then call the storeFinder JSON endpoint via page.evaluate so
-    we reuse the warmed-up session cookies.
-    """
-    log.info("Checking Smyths (Ascended Heroes / Slough)...")
-    try:
-        page = await context.new_page()
-        try:
-            url = URLS["smyths"]
-            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            # Let Imperva clear + product JS hydrate
-            await page.wait_for_timeout(4000)
-
-            # Online stock — check for "Out of stock" indicator vs Add-to-basket
-            html_lower = (await page.content()).lower()
-            online_oos_signals = (
-                "out of stock for delivery",
-                "out of stock online",
-                "currently out of stock",
-                "unavailable for delivery",
-                "notify me when available",
-            )
-            online_in_stock = not any(s in html_lower for s in online_oos_signals)
-
-            # Per-store stock — call the Hybris storeFinder endpoint from inside
-            # the page so we ride the existing session cookies + Imperva clearance.
-            # Try a few endpoint variants since Hybris paths differ between sites.
-            candidates = [
-                f"/storeFinder/storeAvailability?productCode={SMYTHS_PRODUCT_CODE}&q={SMYTHS_POSTCODE.replace(' ', '+')}",
-                f"/storeFinder/storeAvailability?productCode={SMYTHS_PRODUCT_CODE}&q={SMYTHS_POSTCODE.replace(' ', '%20')}",
-                f"/store-finder/store-availability?productCode={SMYTHS_PRODUCT_CODE}&q={SMYTHS_POSTCODE.replace(' ', '+')}",
-                f"/storefinder/storeAvailability?productCode={SMYTHS_PRODUCT_CODE}&q={SMYTHS_POSTCODE.replace(' ', '+')}",
-            ]
-            store_payload = None
-            store_endpoint_used = None
-            for path in candidates:
-                try:
-                    result = await page.evaluate(
-                        """async (p) => {
-                            const r = await fetch(p, {
-                                headers: {'Accept': 'application/json, text/html, */*'},
-                                credentials: 'include',
-                            });
-                            const text = await r.text();
-                            return {status: r.status, body: text.slice(0, 50000)};
-                        }""",
-                        path,
-                    )
-                    log.info("Smyths: %s → HTTP %s (%d chars)", path, result["status"], len(result["body"]))
-                    if result["status"] == 200 and len(result["body"]) > 100:
-                        store_payload = result["body"]
-                        store_endpoint_used = path
-                        break
-                except Exception as exc:
-                    log.warning("Smyths: endpoint probe failed for %s: %s", path, exc)
-
-            # Parse stock at Slough
-            slough_in_stock = False
-            slough_status_text = None
-            if store_payload:
-                # Try JSON first
-                try:
-                    data = json.loads(store_payload)
-                    # Common Hybris shape: {"data":[{"displayName":"Slough","stockLevelStatus":"inStock"}, ...]}
-                    stores = data.get("data") or data.get("stores") or data.get("results") or []
-                    for s in stores:
-                        name = (s.get("displayName") or s.get("name") or "").lower()
-                        if SMYTHS_TARGET_STORE in name:
-                            status = (s.get("stockLevelStatus") or s.get("stockLevel") or s.get("availability") or "").lower()
-                            slough_status_text = status or "(unknown)"
-                            slough_in_stock = "in" in status and "out" not in status  # 'inStock' / 'lowStock'
-                            log.info("Smyths: Slough store JSON match — %s", status)
-                            break
-                except Exception:
-                    # HTML fragment — search for Slough row
-                    soup = BeautifulSoup(store_payload, "html.parser")
-                    for row in soup.find_all(string=re.compile("slough", re.I)):
-                        parent = row.parent
-                        # walk up to find the row container, then look for stock indicator
-                        for _ in range(5):
-                            if parent is None: break
-                            txt = parent.get_text(" ", strip=True).lower()
-                            if "in stock" in txt or "out of stock" in txt or "low stock" in txt:
-                                slough_status_text = txt[:120]
-                                slough_in_stock = "in stock" in txt or "low stock" in txt
-                                log.info("Smyths: Slough store HTML match — %s", slough_status_text[:80])
-                                break
-                            parent = parent.parent
-                        if slough_status_text:
-                            break
-
-            if not store_payload:
-                log.warning("Smyths: no working storeFinder endpoint found — skipping store stock this round")
-        finally:
-            await page.close()
-
-        # Compare to previous state
-        prev = state.get("smyths", {})
-        first_run = not prev
-
-        snapshot = {
-            "online":   online_in_stock,
-            "slough":   slough_in_stock,
-            "slough_status": slough_status_text,
-            "endpoint": store_endpoint_used,
-        }
-
-        if first_run:
-            await send_telegram(
-                f"<b>🟦 SMYTHS — Monitoring Started</b>\n\n"
-                f"<b>Product:</b> {SMYTHS_PRODUCT_NAME}\n"
-                f"<b>Target store:</b> Slough ({SMYTHS_POSTCODE})\n\n"
-                f"🌐 Online: {'✅ In stock' if online_in_stock else '❌ Out of stock'}\n"
-                f"🏬 Slough: {'✅ In stock' if slough_in_stock else '❌ Out of stock'}"
-                + (f" ({slough_status_text})" if slough_status_text else " (status unknown)"),
-                client,
-            )
-        else:
-            alerts = []
-            if online_in_stock and not prev.get("online"):
-                alerts.append(
-                    f"🌐 <b>SMYTHS ONLINE — IN STOCK!</b>\n"
-                    f'<a href="{URLS["smyths"]}">👉 {SMYTHS_PRODUCT_NAME}</a>'
-                )
-            elif prev.get("online") and not online_in_stock:
-                log.info("Smyths: online went out of stock")
-            if slough_in_stock and not prev.get("slough"):
-                alerts.append(
-                    f"🏬 <b>SMYTHS SLOUGH — IN STOCK!</b>\n"
-                    f"{SMYTHS_PRODUCT_NAME}\n"
-                    f'<a href="{URLS["smyths"]}">👉 Product page</a>'
-                )
-            elif prev.get("slough") and not slough_in_stock:
-                log.info("Smyths: Slough went out of stock")
-
-            for msg in alerts:
-                await send_telegram(msg, client)
-            if not alerts:
-                log.info("Smyths: no changes (online=%s slough=%s)", online_in_stock, slough_in_stock)
-
-        state["smyths"] = snapshot
-
-    except Exception as exc:
-        log.error("Smyths check failed: %s", exc)
-
-    return state
-
-
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -1909,7 +1746,6 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     state["little_things_onepiece"] = {}
     # Don't wipe toycorner — pagination causes products to flicker in/out
     state["_toycorner_startup_sent"] = False
-    state["smyths"]               = {}
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -1924,11 +1760,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "little_things":        {"label": "🛍️ Little Things",        "ok": None, "time": ""},
         "little_things_onepiece": {"label": "🏴‍☠️ Little Things (OP)", "ok": None, "time": ""},
         "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
-        "smyths":               {"label": "🟦 Smyths (AH/Slough)",     "ok": None, "time": ""},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "smyths"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner"}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -1985,7 +1820,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_smyths = 0.0
+    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = 0.0
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -2091,10 +1926,6 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("toycorner", check_toycorner(state, client)))
                 last_toycorner = now
 
-            if "smyths" not in DISABLED_RETAILERS and now - last_smyths >= INTERVALS.get("smyths", 300):
-                headless_tasks.append(("smyths", check_smyths(state, client, headless_context)))
-                last_smyths = now
-
             if headless_tasks:
                 log.info("Running %d headless checks concurrently...", len(headless_tasks))
                 results = await asyncio.gather(*[t[1] for t in headless_tasks], return_exceptions=True)
@@ -2192,8 +2023,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🕹️ ZGames: every {INTERVALS['zgames'] // 60} min\n"
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
-                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
-                        f"🟦 Smyths (AH/Slough): every {INTERVALS.get('smyths', 300) // 60} min\n\n"
+                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n\n"
                         "Send <code>stop</code> to pause.",
                         client,
                     )
