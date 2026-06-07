@@ -2002,6 +2002,15 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
 
             # Only accept commands from the authorised user
             if chat_id != str(TELEGRAM_CHAT_ID):
+                # TEMP DEBUG: log unauthorised chat IDs so we can capture new ones
+                from_user = msg.get("from", {})
+                log.info(
+                    "Telegram: ignored message from chat_id=%s (name=%r username=%r text=%r)",
+                    chat_id,
+                    f"{from_user.get('first_name','')} {from_user.get('last_name','')}".strip(),
+                    from_user.get("username",""),
+                    text[:80],
+                )
                 continue
 
             log.info("Telegram command received: %r", text)
