@@ -128,6 +128,11 @@ TELEGRAM_CHAT_ID    = CFG["telegram_chat_id"]
 INTERVALS           = CFG["intervals"]
 URLS                = CFG["urls"]
 
+# Optional second recipient — gets every alert N seconds after the primary chat.
+# Unset both to disable. Defaults: no delayed forward.
+TELEGRAM_CHAT_ID_DELAYED = os.environ.get("TELEGRAM_CHAT_ID_DELAYED", "").strip()
+TELEGRAM_DELAY_SECONDS   = int(os.environ.get("TELEGRAM_DELAY_SECONDS", "120"))
+
 TELEGRAM_ENABLED = (
     TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN"
     and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID"
@@ -220,11 +225,57 @@ MAX_TG_LENGTH = 4000  # Telegram limit is 4096, keep headroom
 HEARTBEAT: dict = {"last": 0.0}
 
 
+async def _send_delayed_forward(original_message: str, client: httpx.AsyncClient) -> None:
+    """Fire-and-forget: after N seconds, send the same message to the secondary chat.
+    Wrapped in try/except so any failure (cancellation, network) never crashes the caller."""
+    try:
+        await asyncio.sleep(TELEGRAM_DELAY_SECONDS)
+        # Re-chunk independently — original_message is the full pre-split text
+        msg = original_message
+        chunks = []
+        while len(msg) > MAX_TG_LENGTH:
+            split_at = msg.rfind("\n", 0, MAX_TG_LENGTH)
+            if split_at == -1:
+                split_at = MAX_TG_LENGTH
+            chunks.append(msg[:split_at])
+            msg = msg[split_at:].lstrip("\n")
+        chunks.append(msg)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        for chunk in chunks:
+            try:
+                resp = await client.post(
+                    url,
+                    json={
+                        "chat_id": TELEGRAM_CHAT_ID_DELAYED,
+                        "text": chunk,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    log.warning("Delayed forward error %s: %s", resp.status_code, resp.text[:160])
+                else:
+                    log.info("Delayed forward sent (%d chars)", len(chunk))
+                await asyncio.sleep(0.5)
+            except Exception as exc:
+                log.warning("Delayed forward chunk failed: %s", exc)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log.warning("Delayed forward outer error: %s", exc)
+
+
 async def send_telegram(message: str, client: httpx.AsyncClient) -> int | None:
     """Send a Telegram message, splitting if needed. Returns message_id of first chunk."""
     if not TELEGRAM_ENABLED:
         log.info("[TELEGRAM DISABLED] %s", message[:120])
         return None
+
+    # Schedule the delayed forward BEFORE we await the primary send, so its
+    # 120s timer starts from approximately the same moment we send to the user.
+    if TELEGRAM_CHAT_ID_DELAYED:
+        asyncio.create_task(_send_delayed_forward(message, client))
 
     chunks = []
     while len(message) > MAX_TG_LENGTH:
@@ -2002,15 +2053,6 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
 
             # Only accept commands from the authorised user
             if chat_id != str(TELEGRAM_CHAT_ID):
-                # TEMP DEBUG: log unauthorised chat IDs so we can capture new ones
-                from_user = msg.get("from", {})
-                log.info(
-                    "Telegram: ignored message from chat_id=%s (name=%r username=%r text=%r)",
-                    chat_id,
-                    f"{from_user.get('first_name','')} {from_user.get('last_name','')}".strip(),
-                    from_user.get("username",""),
-                    text[:80],
-                )
                 continue
 
             log.info("Telegram command received: %r", text)
