@@ -73,7 +73,7 @@ def _config_from_env() -> dict | None:
             "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 300,
+            "kinokuniya": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -2089,7 +2089,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("toycorner", check_toycorner(state, client)))
                 last_toycorner = now
 
-            if "kinokuniya" not in DISABLED_RETAILERS and now - last_kinokuniya >= INTERVALS.get("kinokuniya", 300):
+            if "kinokuniya" not in DISABLED_RETAILERS and now - last_kinokuniya >= INTERVALS.get("kinokuniya", 120):
                 headless_tasks.append(("kinokuniya", check_kinokuniya(state, client)))
                 last_kinokuniya = now
 
@@ -2191,7 +2191,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
-                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 300) // 60} min\n\n"
+                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n\n"
                         "Send <code>stop</code> to pause.",
                         client,
                     )
