@@ -73,6 +73,7 @@ def _config_from_env() -> dict | None:
             "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
+            "kinokuniya": 300,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -85,6 +86,7 @@ def _config_from_env() -> dict | None:
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
             "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
+            "kinokuniya": "https://uae.kinokuniya.com/products?is_searching=true&keywords=pokemon+tcg",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -210,6 +212,7 @@ def load_state() -> dict:
         "geekay":               {},
         "little_things":        {},
         "toycorner":            {},
+        "kinokuniya":           {},
     }
 
 
@@ -1166,6 +1169,113 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+# ─── KINOKUNIYA UAE ───────────────────────────────────────────────────────────
+
+async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
+    """Kinokuniya UAE — search results for 'pokemon tcg'.
+
+    AWS ELB + WAF: plain httpx returns 403, chrome impersonation gets blocked,
+    Safari impersonation + a homepage warmup GET works.
+
+    v1: tracks which products appear in the search results (by barcode in
+    /bw/{N} URLs). Alerts on new products only — search page doesn't expose
+    a stock indicator so we treat all results as 'in stock'. A per-product
+    stock fetch could be added later if Kinokuniya starts listing OOS items
+    in search."""
+    log.info("Checking Kinokuniya UAE...")
+
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc)
+        raise
+
+    current: dict[str, dict] = {}
+
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+
+        async with AsyncSession(impersonate="safari17_0") as cf:
+            # Warm up — AWS WAF cookies get set on first visit
+            try:
+                await cf.get("https://uae.kinokuniya.com/", timeout=15)
+            except Exception:
+                pass
+            resp = await cf.get(
+                URLS["kinokuniya"],
+                headers={
+                    "Referer": "https://uae.kinokuniya.com/",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=25,
+            )
+
+        if resp.status_code != 200:
+            log.warning("Kinokuniya: HTTP %s", resp.status_code)
+            return state
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        boxes = soup.select("div#image_or_detail div.box")
+        log.info("Kinokuniya: %d product card(s) on results page", len(boxes))
+
+        for box in boxes:
+            link = box.select_one("a[href*='/bw/']")
+            if not link:
+                continue
+            href = link.get("href", "")
+            m = re.search(r"/bw/(\d+)", href)
+            if not m:
+                continue
+            barcode = m.group(1)
+
+            title_el = box.select_one("span.title")
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title or len(title) < 3:
+                continue
+
+            price_el = box.select_one(f"span#search_product_image_online_price_{barcode}")
+            price = price_el.get_text(strip=True) if price_el else "N/A"
+
+            prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
+
+            current[barcode] = {
+                "title":     title,
+                "url":       prod_url,
+                "price":     price,
+                "available": True,  # search hits are treated as available; no stock indicator on listing page
+            }
+
+        if not current:
+            log.warning("Kinokuniya: no products parsed — selectors may have changed")
+            return state
+
+        prev      = state.get("kinokuniya", {})
+        first_run = len(prev) == 0
+
+        if first_run:
+            lines = [f"<b>📚 KINOKUNIYA UAE — Monitoring Started ({len(current)} product{'s' if len(current)!=1 else ''})</b>"]
+            for p in current.values():
+                lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+            log.info("Kinokuniya: baseline sent (%d products)", len(current))
+        else:
+            new_products = [p for bid, p in current.items() if bid not in prev]
+            if new_products:
+                lines = [f"<b>🆕 KINOKUNIYA UAE — {len(new_products)} New Product(s)!</b>"]
+                for p in new_products:
+                    lines.append(fmt_product(p))
+                await send_telegram("\n".join(lines), client)
+            else:
+                log.info("Kinokuniya: no new products")
+
+        state["kinokuniya"] = current
+
+    except Exception as exc:
+        log.error("Kinokuniya check failed: %s", exc)
+
+    return state
+
+
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -1797,6 +1907,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     state["little_things_onepiece"] = {}
     # Don't wipe toycorner — pagination causes products to flicker in/out
     state["_toycorner_startup_sent"] = False
+    state["kinokuniya"]            = {}
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -1811,10 +1922,11 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "little_things":        {"label": "🛍️ Little Things",        "ok": None, "time": ""},
         "little_things_onepiece": {"label": "🏴‍☠️ Little Things (OP)", "ok": None, "time": ""},
         "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
+        "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya"}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -1871,7 +1983,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = 0.0
+    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = 0.0
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -1977,6 +2089,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("toycorner", check_toycorner(state, client)))
                 last_toycorner = now
 
+            if "kinokuniya" not in DISABLED_RETAILERS and now - last_kinokuniya >= INTERVALS.get("kinokuniya", 300):
+                headless_tasks.append(("kinokuniya", check_kinokuniya(state, client)))
+                last_kinokuniya = now
+
             if headless_tasks:
                 log.info("Running %d headless checks concurrently...", len(headless_tasks))
                 results = await asyncio.gather(*[t[1] for t in headless_tasks], return_exceptions=True)
@@ -2074,7 +2190,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🕹️ ZGames: every {INTERVALS['zgames'] // 60} min\n"
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
-                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n\n"
+                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
+                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 300) // 60} min\n\n"
                         "Send <code>stop</code> to pause.",
                         client,
                     )
