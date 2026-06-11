@@ -70,7 +70,7 @@ def _config_from_env() -> dict | None:
         "telegram_bot_token": token,
         "telegram_chat_id": chat,
         "intervals": {
-            "otakume": 60, "virgin_megastore": 60, "legends_own_the_game": 60,
+            "otakume": 60, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
             "kinokuniya": 120,
@@ -78,6 +78,7 @@ def _config_from_env() -> dict | None:
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
             "virgin_megastore": "https://www.virginmegastore.ae/en/selection/general-merchandise/pokemon-merchandise/pokemon-tcg/c/n9992162",
+            "virgin_megastore_onepiece": "https://www.virginmegastore.ae/en/search?text=one+piece+card+game",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "magrudy": "https://www.magrudy.com/search?q=tcg",
@@ -205,6 +206,7 @@ def load_state() -> dict:
     return {
         "otakume":              {},
         "virgin_megastore":     {},
+        "virgin_megastore_onepiece": {},
         "legends_own_the_game": {},
         "colorland_toys":       {},
         "magrudy":              {},
@@ -551,7 +553,15 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
 # ─── VIRGIN MEGASTORE ─────────────────────────────────────────────────────────
 
-async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict:
+async def check_virgin_megastore(
+    state: dict,
+    client: httpx.AsyncClient,
+    *,
+    url_key: str = "virgin_megastore",
+    state_key: str = "virgin_megastore",
+    log_name: str = "Virgin Megastore",
+    headline: str = "🇦🇪 VIRGIN MEGASTORE",
+) -> dict:
     """Virgin Megastore — SAP Hybris, product grid is server-rendered.
 
     Uses curl_cffi (impersonating Chrome's TLS fingerprint) instead of httpx:
@@ -559,8 +569,11 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
     Python from the TLS handshake alone. curl_cffi sends a ClientHello
     indistinguishable from real Chrome, which bypasses Virgin's anti-bot layer
     from the same IP that httpx can't get through. The `client` param is
-    retained for Telegram calls and compatibility with the dispatch loop."""
-    log.info("Checking Virgin Megastore...")
+    retained for Telegram calls and compatibility with the dispatch loop.
+
+    Parametrised so the same parser can serve multiple Virgin category pages
+    (Pokemon TCG, One Piece TCG, etc) — just pass a different url_key/state_key."""
+    log.info("Checking %s...", log_name)
 
     # Lazy import — isolates the dependency and keeps the file importable even
     # if curl_cffi isn't installed yet (first Railway deploy with new reqs).
@@ -582,13 +595,13 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
                 pass  # best-effort; the real request still carries what we got
 
             resp = await cf.get(
-                URLS["virgin_megastore"],
+                URLS[url_key],
                 headers={"Referer": "https://www.virginmegastore.ae/en/"},
                 timeout=25,
             )
 
         if resp.status_code != 200:
-            log.warning("Virgin Megastore returned HTTP %s", resp.status_code)
+            log.warning("%s returned HTTP %s", log_name, resp.status_code)
             raise RuntimeError(f"HTTP {resp.status_code}")
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -619,18 +632,18 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
             current[key] = {"title": title, "url": url, "price": price, "available": available}
 
         if not current:
-            log.warning("Virgin Megastore: no products found — selectors may need updating")
+            log.warning("%s: no products found — selectors may need updating", log_name)
             raise RuntimeError("no products parsed")
 
-        log.info("Virgin Megastore: %d products found", len(current))
+        log.info("%s: %d products found", log_name, len(current))
 
-        prev      = state.get("virgin_megastore", {})
+        prev      = state.get(state_key, {})
         first_run = len(prev) == 0
 
         if first_run:
             in_stock  = [v for v in current.values() if v["available"]]
             out_stock = [v for v in current.values() if not v["available"]]
-            lines = [f"<b>🇦🇪 VIRGIN MEGASTORE — Monitoring Started ({len(current)} products)</b>"]
+            lines = [f"<b>{headline} — Monitoring Started ({len(current)} products)</b>"]
             if in_stock:
                 lines.append("\n✅ <b>In Stock:</b>")
                 for p in in_stock:
@@ -640,7 +653,7 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
                 for p in out_stock:
                     lines.append(fmt_product(p))
             await send_telegram("\n".join(lines), client)
-            log.info("Virgin Megastore: baseline sent (%d products)", len(current))
+            log.info("%s: baseline sent (%d products)", log_name, len(current))
         else:
             new_products, restocked, went_oos = [], [], []
             for pid, prod in current.items():
@@ -650,30 +663,41 @@ async def check_virgin_megastore(state: dict, client: httpx.AsyncClient) -> dict
                     (restocked if prod["available"] else went_oos).append(prod)
 
             if new_products:
-                lines = [f"<b>🆕 VIRGIN MEGASTORE — {len(new_products)} New Product(s)!</b>"]
+                lines = [f"<b>🆕 {headline} — {len(new_products)} New Product(s)!</b>"]
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
             if restocked:
-                lines = ["<b>🟢 VIRGIN MEGASTORE — Back In Stock!</b>"]
+                lines = [f"<b>🟢 {headline} — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
             if went_oos:
-                lines = ["<b>🔴 VIRGIN MEGASTORE — Out of Stock</b>"]
+                lines = [f"<b>🔴 {headline} — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
             if not (new_products or restocked or went_oos):
-                log.info("Virgin Megastore: no changes")
+                log.info("%s: no changes", log_name)
 
-        state["virgin_megastore"] = current
+        state[state_key] = current
 
     except Exception as exc:
-        log.error("Virgin Megastore check failed: %s", exc)
+        log.error("%s check failed: %s", log_name, exc)
         raise
 
     return state
+
+
+async def check_virgin_megastore_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
+    """Virgin Megastore — One Piece Card Game search results."""
+    return await check_virgin_megastore(
+        state, client,
+        url_key="virgin_megastore_onepiece",
+        state_key="virgin_megastore_onepiece",
+        log_name="Virgin Megastore (OP)",
+        headline="🏴‍☠️ VIRGIN MEGASTORE (OP)",
+    )
 
 
 # ─── LEGENDS OWN THE GAME ─────────────────────────────────────────────────────
@@ -1896,6 +1920,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # Always re-send every site's full product list on every start
     state["otakume"]              = {}
     state["virgin_megastore"]     = {}
+    state["virgin_megastore_onepiece"] = {}
     state["legends_own_the_game"] = {}
     # Don't wipe colorland — pagination causes products to flicker in/out
     # state["colorland_toys"]     = {}
@@ -1914,6 +1939,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     CHECK_STATUS: dict[str, dict] = {
         "otakume":              {"label": "🟡 Otakume",              "ok": None, "time": ""},
         "virgin_megastore":     {"label": "🇦🇪 Virgin Megastore",    "ok": None, "time": ""},
+        "virgin_megastore_onepiece": {"label": "🏴‍☠️ Virgin Megastore (OP)", "ok": None, "time": ""},
         "legends_own_the_game": {"label": "🎴 Legends Own The Game", "ok": None, "time": ""},
         "colorland_toys":       {"label": "🧩 Colorland Toys",       "ok": None, "time": ""},
         "magrudy":              {"label": "📚 Magrudy",               "ok": None, "time": ""},
@@ -1926,7 +1952,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya"}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -1983,7 +2009,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = 0.0
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -2068,6 +2094,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "virgin_megastore" not in DISABLED_RETAILERS and now - last_virgin >= INTERVALS["virgin_megastore"]:
                 headless_tasks.append(("virgin_megastore", check_virgin_megastore(state, client)))
                 last_virgin = now
+
+            if "virgin_megastore_onepiece" not in DISABLED_RETAILERS and now - last_virgin_op >= INTERVALS.get("virgin_megastore_onepiece", 60):
+                headless_tasks.append(("virgin_megastore_onepiece", check_virgin_megastore_onepiece(state, client)))
+                last_virgin_op = now
 
             if "legends_own_the_game" not in DISABLED_RETAILERS and now - last_legends >= INTERVALS["legends_own_the_game"]:
                 headless_tasks.append(("legends_own_the_game", check_legends_own_the_game(state, client)))
