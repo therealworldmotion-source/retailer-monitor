@@ -1746,7 +1746,14 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                         continue
                     if handle in current:
                         continue  # already have full variant data from the collection
-                    if "pokemon" not in title.lower() and "pikachu" not in title.lower():
+                    tl = title.lower()
+                    if "pokemon" not in tl and "pikachu" not in tl:
+                        continue
+                    # Search-sourced items must look like TCG — the search also
+                    # surfaces Pokemon figures/Lego/Funko which we don't track.
+                    TCG_HINTS = ("tcg", "booster", "elite trainer", "card", "deck",
+                                 "blister", "etb", "tin", "ex box", "premium collection")
+                    if not any(h in tl for h in TCG_HINTS):
                         continue
                     current[handle] = {
                         "title": title,
