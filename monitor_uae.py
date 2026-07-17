@@ -84,6 +84,7 @@ def _config_from_env() -> dict | None:
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
             "magrudy": "https://www.magrudy.com/search?q=tcg",
             "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
+            "zgames_accented": "https://zgames.ae/catalogsearch/result/?q=Pok%C3%A9mon+tcg",
             "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
@@ -787,54 +788,57 @@ async def check_legends_own_the_game(state: dict, client: httpx.AsyncClient) -> 
     try:
         await asyncio.sleep(random.uniform(1, 3))
 
-        # Paginate through all results (Ecwid API max 100 per page)
-        offset = 0
-        limit  = 100
-        while True:
-            api_url = (
-                f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
-                f"?keyword=pokemon&category=176121252&enabled=true&limit={limit}&offset={offset}&lang=en"
-            )
-            resp = await client.get(
-                api_url,
-                headers={
-                    "Authorization": f"Bearer {ECWID_TOKEN}",
-                    "Accept":        "application/json",
-                    "User-Agent":    random.choice(USER_AGENTS),
-                },
-                timeout=25,
-            )
+        # Paginate through all results (Ecwid API max 100 per page).
+        # Search both the plain and accented spellings; merge by product key.
+        limit = 100
+        for kw in ("pokemon", "Pok%C3%A9mon"):  # plain + accented (Pokémon)
+            offset = 0
+            while True:
+                api_url = (
+                    f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
+                    f"?keyword={kw}&category=176121252&enabled=true&limit={limit}&offset={offset}&lang=en"
+                )
+                resp = await client.get(
+                    api_url,
+                    headers={
+                        "Authorization": f"Bearer {ECWID_TOKEN}",
+                        "Accept":        "application/json",
+                        "User-Agent":    random.choice(USER_AGENTS),
+                    },
+                    timeout=25,
+                )
 
-            if resp.status_code != 200:
-                log.warning("Legends Own The Game: API returned HTTP %s", resp.status_code)
-                return state
+                if resp.status_code != 200:
+                    log.warning("Legends Own The Game: API returned HTTP %s (keyword=%s)", resp.status_code, kw)
+                    break  # skip this keyword; keep whatever the other term returned
 
-            data  = resp.json()
-            items = data.get("items", [])
-            total = data.get("total", 0)
-            log.info("Legends Own The Game: fetched %d/%d products (offset=%d)",
-                     len(items), total, offset)
+                data  = resp.json()
+                items = data.get("items", [])
+                total = data.get("total", 0)
+                log.info("Legends Own The Game: fetched %d/%d products (keyword=%s offset=%d)",
+                         len(items), total, kw, offset)
 
-            for item in items:
-                name = item.get("name", "")
-                if not name or len(name) < 3:
-                    continue
-                price      = item.get("defaultDisplayedPriceFormatted", "N/A")
-                in_stock   = bool(item.get("inStock", False))
-                prod_url   = item.get("url", "")
-                ecwid_id   = item.get("id")
-                key        = product_key(name)
-                current[key] = {
-                    "title":     name,
-                    "url":       prod_url,
-                    "price":     price,
-                    "available": in_stock,
-                    "ecwid_id":  ecwid_id,
-                }
+                for item in items:
+                    name = item.get("name", "")
+                    if not name or len(name) < 3:
+                        continue
+                    price      = item.get("defaultDisplayedPriceFormatted", "N/A")
+                    in_stock   = bool(item.get("inStock", False))
+                    prod_url   = item.get("url", "")
+                    ecwid_id   = item.get("id")
+                    key        = product_key(name)
+                    current[key] = {
+                        "title":     name,
+                        "url":       prod_url,
+                        "price":     price,
+                        "available": in_stock,
+                        "ecwid_id":  ecwid_id,
+                    }
 
-            offset += len(items)
-            if not items or offset >= total:
-                break
+                offset += len(items)
+                if not items or offset >= total:
+                    break
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
         if not current:
             log.warning("Legends Own The Game: no Pokemon products returned by API")
@@ -1424,41 +1428,45 @@ async def check_zgames(state: dict, client: httpx.AsyncClient, context: BrowserC
     current: dict[str, dict] = {}
 
     try:
-        page = await context.new_page()
-        try:
-            await page.goto(
-                URLS["zgames"],
-                wait_until="domcontentloaded",
-                timeout=35_000,
-            )
-            await page.wait_for_timeout(3000)
+        # Search both plain and accented spellings; merge by product key.
+        zgames_urls = [URLS["zgames"], URLS.get("zgames_accented")]
+        zgames_urls = [u for u in zgames_urls if u]
 
-            html = await page.content()
-        finally:
-            await page.close()
+        for zu in zgames_urls:
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    zu,
+                    wait_until="domcontentloaded",
+                    timeout=35_000,
+                )
+                await page.wait_for_timeout(3000)
+                html = await page.content()
+            finally:
+                await page.close()
 
-        soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
 
-        for item in soup.select("li.product-item"):
-            title_el = item.select_one("a.product-item-link")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True)
-            if not title or len(title) < 3:
-                continue
+            for item in soup.select("li.product-item"):
+                title_el = item.select_one("a.product-item-link")
+                if not title_el:
+                    continue
+                title = title_el.get_text(strip=True)
+                if not title or len(title) < 3:
+                    continue
 
-            href = title_el.get("href", "")
-            url = href if href.startswith("http") else f"https://zgames.ae{href}"
+                href = title_el.get("href", "")
+                url = href if href.startswith("http") else f"https://zgames.ae{href}"
 
-            price_el = item.select_one(".price")
-            price = price_el.get_text(strip=True) if price_el else "N/A"
+                price_el = item.select_one(".price")
+                price = price_el.get_text(strip=True) if price_el else "N/A"
 
-            stock_el = item.select_one(".stock")
-            stock_text = stock_el.get_text(strip=True).lower() if stock_el else ""
-            available = "out of stock" not in stock_text
+                stock_el = item.select_one(".stock")
+                stock_text = stock_el.get_text(strip=True).lower() if stock_el else ""
+                available = "out of stock" not in stock_text
 
-            key = product_key(title)
-            current[key] = {"title": title, "url": url, "price": price, "available": available}
+                key = product_key(title)
+                current[key] = {"title": title, "url": url, "price": price, "available": available}
 
         if not current:
             log.warning("ZGames: no products found — selectors may have changed")
