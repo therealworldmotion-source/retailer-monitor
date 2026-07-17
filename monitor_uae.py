@@ -1720,6 +1720,49 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
             page_num += 1
             await asyncio.sleep(random.uniform(1, 2))
 
+        # Supplement the collection with Shopify search (plain + accented
+        # 'Pokémon') to catch Pokemon products filed OUTSIDE the pokemon-tcg
+        # collection. suggest.json lacks variant IDs, so search-only items get
+        # variant_id=None (they won't auto-cart) — acceptable, since the
+        # collection above covers the TCG catalogue with full data. Products
+        # already found in the collection keep their richer collection data.
+        collection_count = len(current)
+        for q in ("pokemon", "pok%C3%A9mon"):
+            try:
+                surl = (
+                    "https://littlethingsme.com/search/suggest.json"
+                    f"?q={q}&resources[type]=product&resources[limit]=10"
+                )
+                sresp = await client.get(surl, headers=get_json_headers(), timeout=20)
+                if sresp.status_code != 200:
+                    log.warning("Little Things search q=%s: HTTP %s", q, sresp.status_code)
+                    continue
+                sprods = (json.loads(sresp.content)
+                          .get("resources", {}).get("results", {}).get("products", []))
+                for p in sprods:
+                    handle = p.get("handle", "")
+                    title  = p.get("title", "")
+                    if not handle or not title or len(title) < 3:
+                        continue
+                    if handle in current:
+                        continue  # already have full variant data from the collection
+                    if "pokemon" not in title.lower() and "pikachu" not in title.lower():
+                        continue
+                    current[handle] = {
+                        "title": title,
+                        "url": f"https://littlethingsme.com/products/{handle}",
+                        "price": f"AED {p.get('price', '0')}",
+                        "available": bool(p.get("available")),
+                        "variant_id": None,  # suggest.json omits variants
+                    }
+            except Exception as exc:
+                log.warning("Little Things search q=%s failed: %s", q, exc)
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        if len(current) > collection_count:
+            log.info("Little Things: search added %d product(s) outside the collection",
+                     len(current) - collection_count)
+
         if not current:
             log.warning("Little Things: no Pokemon products found")
             return state
