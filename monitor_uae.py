@@ -73,7 +73,7 @@ def _config_from_env() -> dict | None:
             "otakume": 60, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -93,6 +93,8 @@ def _config_from_env() -> dict | None:
             "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
             "kinokuniya": "https://uae.kinokuniya.com/products?is_searching=true&keywords=pokemon+tcg",
             "kinokuniya_accented": "https://uae.kinokuniya.com/products?is_searching=true&keywords=Pok%C3%A9mon+tcg",
+            # Curated Pokémon drop/event page(s). Comma-separate more IDs via env if needed.
+            "kinokuniya_event": "https://uae.kinokuniya.com/events/1243",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -220,6 +222,7 @@ def load_state() -> dict:
         "little_things":        {},
         "toycorner":            {},
         "kinokuniya":           {},
+        "kinokuniya_event":     {},
     }
 
 
@@ -1355,6 +1358,141 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+async def check_kinokuniya_event(state: dict, client: httpx.AsyncClient) -> dict:
+    """Kinokuniya UAE — curated Pokémon drop/event page (e.g. /events/1243).
+
+    These pages list a small hand-picked set of Pokemon TCG products for a
+    drop. Products are <a href='/bw/{barcode}'> links with an adjacent AED
+    price. We track them by barcode and alert on:
+      • a NEW product appearing on the event page (the drop expanding / going live)
+      • a PRICE change on an existing product (catches any discount)
+    """
+    log.info("Checking Kinokuniya event page...")
+
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc)
+        raise
+
+    current: dict[str, dict] = {}
+
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+
+        async with AsyncSession(impersonate="safari17_0") as cf:
+            try:
+                await cf.get("https://uae.kinokuniya.com/", timeout=15)
+            except Exception:
+                pass
+            resp = await cf.get(
+                URLS["kinokuniya_event"],
+                headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
+                timeout=25,
+            )
+
+        if resp.status_code != 200:
+            log.warning("Kinokuniya event: HTTP %s", resp.status_code)
+            return state
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title_el = soup.select_one("h2.eventDetTitle") or soup.select_one("title")
+        event_name = title_el.get_text(strip=True) if title_el else "Kinokuniya Event"
+
+        # Each product appears as one or more /bw/{barcode} links; the text
+        # link carries the title, and an AED price sits nearby. Merge by barcode.
+        for a in soup.select("a[href*='/bw/']"):
+            href = a.get("href", "")
+            m = re.search(r"/bw/(\d+)", href)
+            if not m:
+                continue
+            barcode = m.group(1)
+
+            txt = a.get_text(" ", strip=True)
+            img = a.select_one("img")
+            title = txt or (img.get("alt", "") if img else "")
+
+            # Price: search this link's ancestors for an AED amount
+            price = "N/A"
+            node = a
+            for _ in range(4):
+                node = node.parent
+                if not node:
+                    break
+                pm = re.search(r"AED\s*[\d.,]+", node.get_text(" ", strip=True))
+                if pm:
+                    price = pm.group(0)
+                    break
+
+            prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
+            existing = current.get(barcode)
+            # Prefer the entry that has a real title over an image-only link
+            if existing and not title:
+                continue
+            current[barcode] = {
+                "title":     title or (existing or {}).get("title", "") or f"Product {barcode}",
+                "url":       prod_url,
+                "price":     price if price != "N/A" else (existing or {}).get("price", "N/A"),
+                "available": True,
+            }
+
+        if not current:
+            log.warning("Kinokuniya event: no products parsed — page layout may have changed")
+            return state
+
+        log.info("Kinokuniya event '%s': %d product(s)", event_name, len(current))
+
+        prev      = state.get("kinokuniya_event", {})
+        first_run = len(prev) == 0
+
+        if first_run:
+            lines = [f"<b>🎴 KINOKUNIYA EVENT — {event_name} ({len(current)} product{'s' if len(current)!=1 else ''})</b>"]
+            for p in current.values():
+                lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+            log.info("Kinokuniya event: baseline sent (%d products)", len(current))
+        else:
+            new_products = [p for bid, p in current.items() if bid not in prev]
+            price_drops, price_changes = [], []
+            for bid, p in current.items():
+                if bid in prev and p["price"] != prev[bid].get("price") and p["price"] != "N/A" and prev[bid].get("price") not in (None, "N/A"):
+                    (price_drops if _aed_val(p["price"]) < _aed_val(prev[bid]["price"]) else price_changes).append((prev[bid], p))
+
+            if new_products:
+                lines = [f"<b>🆕 KINOKUNIYA EVENT — {len(new_products)} New on '{event_name}'!</b>"]
+                for p in new_products:
+                    lines.append(fmt_product(p))
+                await send_telegram("\n".join(lines), client)
+            if price_drops:
+                lines = [f"<b>💰 KINOKUNIYA EVENT — Price Drop!</b>"]
+                for old, new in price_drops:
+                    lines.append(f"  🔻 {new['title']}: <s>{old['price']}</s> → <b>{new['price']}</b>\n  {new['url']}")
+                await send_telegram("\n".join(lines), client)
+            if price_changes:
+                lines = [f"<b>🔺 KINOKUNIYA EVENT — Price Changed</b>"]
+                for old, new in price_changes:
+                    lines.append(f"  {new['title']}: {old['price']} → {new['price']}\n  {new['url']}")
+                await send_telegram("\n".join(lines), client)
+            if not (new_products or price_drops or price_changes):
+                log.info("Kinokuniya event: no changes")
+
+        state["kinokuniya_event"] = current
+
+    except Exception as exc:
+        log.error("Kinokuniya event check failed: %s", exc)
+
+    return state
+
+
+def _aed_val(price: str) -> float:
+    """Parse 'AED 279.00' → 279.0; returns inf on failure so it never counts as a drop."""
+    m = re.search(r"[\d.,]+", price or "")
+    try:
+        return float(m.group(0).replace(",", "")) if m else float("inf")
+    except Exception:
+        return float("inf")
+
+
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -2042,6 +2180,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # Don't wipe toycorner — pagination causes products to flicker in/out
     state["_toycorner_startup_sent"] = False
     state["kinokuniya"]            = {}
+    state["kinokuniya_event"]      = {}
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -2058,10 +2197,11 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "little_things_onepiece": {"label": "🏴‍☠️ Little Things (OP)", "ok": None, "time": ""},
         "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
+        "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event"}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -2118,7 +2258,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = 0.0
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -2232,6 +2372,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("kinokuniya", check_kinokuniya(state, client)))
                 last_kinokuniya = now
 
+            if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kinokuniya_event >= INTERVALS.get("kinokuniya_event", 120):
+                headless_tasks.append(("kinokuniya_event", check_kinokuniya_event(state, client)))
+                last_kinokuniya_event = now
+
             if headless_tasks:
                 log.info("Running %d headless checks concurrently...", len(headless_tasks))
                 results = await asyncio.gather(*[t[1] for t in headless_tasks], return_exceptions=True)
@@ -2330,7 +2474,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
-                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n\n"
+                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n"
+                        f"🎴 Kinokuniya Event: every {INTERVALS.get('kinokuniya_event', 120) // 60} min\n\n"
                         "Send <code>stop</code> to pause.",
                         client,
                     )
