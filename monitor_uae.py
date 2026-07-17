@@ -78,6 +78,8 @@ def _config_from_env() -> dict | None:
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
             "virgin_megastore": "https://www.virginmegastore.ae/en/selection/general-merchandise/pokemon-merchandise/pokemon-tcg/c/n9992162",
+            "virgin_megastore_search": "https://www.virginmegastore.ae/en/search?text=pokemon+tcg",
+            "virgin_megastore_accented": "https://www.virginmegastore.ae/en/search?text=Pok%C3%A9mon+tcg",
             "virgin_megastore_onepiece": "https://www.virginmegastore.ae/en/search?text=one+piece+card+game",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
@@ -560,10 +562,11 @@ async def check_virgin_megastore(
     state: dict,
     client: httpx.AsyncClient,
     *,
-    url_key: str = "virgin_megastore",
+    url_keys: tuple = ("virgin_megastore", "virgin_megastore_search", "virgin_megastore_accented"),
     state_key: str = "virgin_megastore",
     log_name: str = "Virgin Megastore",
     headline: str = "🇦🇪 VIRGIN MEGASTORE",
+    keyword_filter: str = "pok",
 ) -> dict:
     """Virgin Megastore — SAP Hybris, product grid is server-rendered.
 
@@ -574,8 +577,12 @@ async def check_virgin_megastore(
     from the same IP that httpx can't get through. The `client` param is
     retained for Telegram calls and compatibility with the dispatch loop.
 
-    Parametrised so the same parser can serve multiple Virgin category pages
-    (Pokemon TCG, One Piece TCG, etc) — just pass a different url_key/state_key."""
+    Fetches every URL in url_keys and merges the products (dedup by key). This
+    lets one category page be augmented with plain + accented keyword searches
+    (e.g. 'pokemon tcg' and 'Pokémon tcg') so accented titles aren't missed.
+    Results from search-type URLs (…/search?text=…) are filtered to titles
+    containing keyword_filter to strip unrelated search noise; category pages
+    are kept whole. Set keyword_filter='' to disable filtering."""
     log.info("Checking %s...", log_name)
 
     # Lazy import — isolates the dependency and keeps the file importable even
@@ -589,6 +596,11 @@ async def check_virgin_megastore(
     try:
         await asyncio.sleep(random.uniform(1, 3))
 
+        urls = [(k, URLS.get(k)) for k in url_keys]
+        urls = [(k, u) for k, u in urls if u]
+        current: dict[str, dict] = {}
+        any_ok = False
+
         async with AsyncSession(impersonate="chrome") as cf:
             # Warm up cookies by hitting the homepage first; Cloudflare sets
             # session cookies on the first visit that are required on deep links.
@@ -597,48 +609,61 @@ async def check_virgin_megastore(
             except Exception:
                 pass  # best-effort; the real request still carries what we got
 
-            resp = await cf.get(
-                URLS[url_key],
-                headers={"Referer": "https://www.virginmegastore.ae/en/"},
-                timeout=25,
-            )
+            for key, page_url in urls:
+                resp = await cf.get(
+                    page_url,
+                    headers={"Referer": "https://www.virginmegastore.ae/en/"},
+                    timeout=25,
+                )
+                if resp.status_code != 200:
+                    log.warning("%s returned HTTP %s for %s", log_name, resp.status_code, key)
+                    continue
+                any_ok = True
+                is_search = "search?text=" in page_url
 
-        if resp.status_code != 200:
-            log.warning("%s returned HTTP %s", log_name, resp.status_code)
-            raise RuntimeError(f"HTTP {resp.status_code}")
+                soup = BeautifulSoup(resp.text, "html.parser")
+                added = 0
+                for item in soup.select(".product-item"):
+                    name_el = item.select_one("a.product-list__name")
+                    if not name_el:
+                        continue
+                    title = name_el.get_text(strip=True)
+                    if not title or len(title) < 3:
+                        continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        current: dict[str, dict] = {}
+                    # Strip search noise: on keyword-search pages keep only
+                    # titles matching the filter (category pages keep all).
+                    if is_search and keyword_filter and keyword_filter not in title.lower():
+                        continue
 
-        for item in soup.select(".product-item"):
-            name_el = item.select_one("a.product-list__name")
-            if not name_el:
-                continue
-            title = name_el.get_text(strip=True)
-            if not title or len(title) < 3:
-                continue
+                    href = name_el.get("href", "")
+                    url  = href if href.startswith("http") else f"https://www.virginmegastore.ae{href}"
 
-            href = name_el.get("href", "")
-            url  = href if href.startswith("http") else f"https://www.virginmegastore.ae{href}"
+                    currency = item.select_one(".price__currency")
+                    number   = item.select_one(".gtm-price-number")
+                    if currency and number:
+                        price = f"{currency.get_text(strip=True)} {number.get_text(strip=True)}"
+                    else:
+                        price = "N/A"
 
-            currency = item.select_one(".price__currency")
-            number   = item.select_one(".gtm-price-number")
-            if currency and number:
-                price = f"{currency.get_text(strip=True)} {number.get_text(strip=True)}"
-            else:
-                price = "N/A"
+                    oos_el    = item.select_one("[class*='out-of-stock'], [class*='sold-out'], [class*='unavailable']")
+                    available = not oos_el
 
-            oos_el    = item.select_one("[class*='out-of-stock'], [class*='sold-out'], [class*='unavailable']")
-            available = not oos_el
+                    pkey = product_key(title)
+                    current[pkey] = {"title": title, "url": url, "price": price, "available": available}
+                    added += 1
 
-            key = product_key(title)
-            current[key] = {"title": title, "url": url, "price": price, "available": available}
+                log.info("%s: %s → %d product(s) merged", log_name, key, added)
+                await asyncio.sleep(random.uniform(0.5, 1.5))
 
+        if not any_ok:
+            log.warning("%s: all URLs failed — skipping state update", log_name)
+            raise RuntimeError("all URLs failed")
         if not current:
             log.warning("%s: no products found — selectors may need updating", log_name)
             raise RuntimeError("no products parsed")
 
-        log.info("%s: %d products found", log_name, len(current))
+        log.info("%s: %d unique products across %d URL(s)", log_name, len(current), len(urls))
 
         prev      = state.get(state_key, {})
         first_run = len(prev) == 0
@@ -696,10 +721,11 @@ async def check_virgin_megastore_onepiece(state: dict, client: httpx.AsyncClient
     """Virgin Megastore — One Piece Card Game search results."""
     return await check_virgin_megastore(
         state, client,
-        url_key="virgin_megastore_onepiece",
+        url_keys=("virgin_megastore_onepiece",),
         state_key="virgin_megastore_onepiece",
         log_name="Virgin Megastore (OP)",
         headline="🏴‍☠️ VIRGIN MEGASTORE (OP)",
+        keyword_filter="one piece",
     )
 
 
