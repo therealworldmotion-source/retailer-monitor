@@ -81,6 +81,7 @@ def _config_from_env() -> dict | None:
             "virgin_megastore_onepiece": "https://www.virginmegastore.ae/en/search?text=one+piece+card+game",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
+            "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
             "magrudy": "https://www.magrudy.com/search?q=tcg",
             "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
             "geekay": "https://www.geekay.com/en/brand/pokemon?goodstuff_genre=571&product_list_order=new&stock=1",
@@ -88,6 +89,7 @@ def _config_from_env() -> dict | None:
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
             "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
             "kinokuniya": "https://uae.kinokuniya.com/products?is_searching=true&keywords=pokemon+tcg",
+            "kinokuniya_accented": "https://uae.kinokuniya.com/products?is_searching=true&keywords=Pok%C3%A9mon+tcg",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -921,60 +923,68 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        page_num    = 1
+        # Search both plain and accented spellings; merge by handle.
+        colorland_bases = [URLS["colorland_toys"], URLS.get("colorland_toys_accented")]
+        colorland_bases = [b for b in colorland_bases if b]
         fetch_error = False
-        while True:
-            url = URLS["colorland_toys"] if page_num == 1 else f"{URLS['colorland_toys']}&page={page_num}"
-            resp = await client.get(
-                url,
-                headers=get_headers("https://colorlandtoys.com/"),
-                timeout=25,
-            )
-            if resp.status_code == 429:
-                log.warning("Colorland Toys: rate limited on page %d — waiting 30s and retrying", page_num)
-                await asyncio.sleep(30)
-                resp = await client.get(url, headers=get_headers("https://colorlandtoys.com/"), timeout=25)
-            if resp.status_code != 200:
-                log.warning("Colorland Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
-                fetch_error = True
+        for base in colorland_bases:
+            page_num = 1
+            while True:
+                url = base if page_num == 1 else f"{base}&page={page_num}"
+                resp = await client.get(
+                    url,
+                    headers=get_headers("https://colorlandtoys.com/"),
+                    timeout=25,
+                )
+                if resp.status_code == 429:
+                    log.warning("Colorland Toys: rate limited on page %d — waiting 30s and retrying", page_num)
+                    await asyncio.sleep(30)
+                    resp = await client.get(url, headers=get_headers("https://colorlandtoys.com/"), timeout=25)
+                if resp.status_code != 200:
+                    log.warning("Colorland Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
+                    fetch_error = True
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                items = soup.select("div.product-item[data-json-product]")
+                log.info("Colorland Toys: page %d — %d items", page_num, len(items))
+
+                if not items:
+                    break
+
+                for item in items:
+                    try:
+                        data = json.loads(item["data-json-product"])
+                    except Exception:
+                        continue
+
+                    handle = data.get("handle", "")
+                    if not handle:
+                        continue
+
+                    variants  = data.get("variants", [{}])
+                    v         = variants[0] if variants else {}
+                    available = bool(v.get("available", True))
+                    price_raw = v.get("price", 0)
+                    price     = f"AED {int(price_raw) // 100}" if price_raw else "N/A"
+
+                    # Title from HTML (not in JSON)
+                    title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
+                    title    = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
+                    if not title or len(title) < 3:
+                        continue
+
+                    prod_url = f"https://colorlandtoys.com/products/{handle}"
+                    current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
+
+                if len(items) < 50:
+                    break  # last page
+                page_num += 1
+                await asyncio.sleep(random.uniform(3, 6))
+
+            if fetch_error:
                 break
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            items = soup.select("div.product-item[data-json-product]")
-            log.info("Colorland Toys: page %d — %d items", page_num, len(items))
-
-            if not items:
-                break
-
-            for item in items:
-                try:
-                    data = json.loads(item["data-json-product"])
-                except Exception:
-                    continue
-
-                handle = data.get("handle", "")
-                if not handle:
-                    continue
-
-                variants  = data.get("variants", [{}])
-                v         = variants[0] if variants else {}
-                available = bool(v.get("available", True))
-                price_raw = v.get("price", 0)
-                price     = f"AED {int(price_raw) // 100}" if price_raw else "N/A"
-
-                # Title from HTML (not in JSON)
-                title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
-                title    = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
-                if not title or len(title) < 3:
-                    continue
-
-                prod_url = f"https://colorlandtoys.com/products/{handle}"
-                current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
-
-            if len(items) < 50:
-                break  # last page
-            page_num += 1
-            await asyncio.sleep(random.uniform(3, 6))
+            await asyncio.sleep(random.uniform(2, 4))
 
         if fetch_error:
             log.warning("Colorland Toys: pagination error — state not updated")
@@ -1219,59 +1229,74 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
     try:
         await asyncio.sleep(random.uniform(1, 3))
 
+        # Search both the plain and accented spellings — Kinokuniya's search
+        # is accent-sensitive, so "pokemon" and "Pokémon" surface different
+        # hits. Merge results by barcode (dedup handles overlap).
+        search_urls = [URLS["kinokuniya"], URLS.get("kinokuniya_accented")]
+        search_urls = [u for u in search_urls if u]
+
+        any_ok = False
         async with AsyncSession(impersonate="safari17_0") as cf:
             # Warm up — AWS WAF cookies get set on first visit
             try:
                 await cf.get("https://uae.kinokuniya.com/", timeout=15)
             except Exception:
                 pass
-            resp = await cf.get(
-                URLS["kinokuniya"],
-                headers={
-                    "Referer": "https://uae.kinokuniya.com/",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                timeout=25,
-            )
 
-        if resp.status_code != 200:
-            log.warning("Kinokuniya: HTTP %s", resp.status_code)
+            for su in search_urls:
+                resp = await cf.get(
+                    su,
+                    headers={
+                        "Referer": "https://uae.kinokuniya.com/",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                    timeout=25,
+                )
+                if resp.status_code != 200:
+                    log.warning("Kinokuniya: HTTP %s for %s", resp.status_code, su)
+                    continue
+                any_ok = True
+
+                soup  = BeautifulSoup(resp.text, "html.parser")
+                boxes = soup.select("div#image_or_detail div.box")
+                log.info("Kinokuniya: %d product card(s) for %s", len(boxes), su.split("keywords=")[-1])
+
+                for box in boxes:
+                    link = box.select_one("a[href*='/bw/']")
+                    if not link:
+                        continue
+                    href = link.get("href", "")
+                    m = re.search(r"/bw/(\d+)", href)
+                    if not m:
+                        continue
+                    barcode = m.group(1)
+
+                    title_el = box.select_one("span.title")
+                    title = title_el.get_text(strip=True) if title_el else ""
+                    if not title or len(title) < 3:
+                        continue
+
+                    price_el = box.select_one(f"span#search_product_image_online_price_{barcode}")
+                    price = price_el.get_text(strip=True) if price_el else "N/A"
+
+                    prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
+
+                    current[barcode] = {
+                        "title":     title,
+                        "url":       prod_url,
+                        "price":     price,
+                        "available": True,  # search hits treated as available; no stock indicator on listing page
+                    }
+                await asyncio.sleep(random.uniform(1, 2))
+
+        if not any_ok:
+            log.warning("Kinokuniya: all searches failed — skipping state update")
             return state
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        boxes = soup.select("div#image_or_detail div.box")
-        log.info("Kinokuniya: %d product card(s) on results page", len(boxes))
-
-        for box in boxes:
-            link = box.select_one("a[href*='/bw/']")
-            if not link:
-                continue
-            href = link.get("href", "")
-            m = re.search(r"/bw/(\d+)", href)
-            if not m:
-                continue
-            barcode = m.group(1)
-
-            title_el = box.select_one("span.title")
-            title = title_el.get_text(strip=True) if title_el else ""
-            if not title or len(title) < 3:
-                continue
-
-            price_el = box.select_one(f"span#search_product_image_online_price_{barcode}")
-            price = price_el.get_text(strip=True) if price_el else "N/A"
-
-            prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
-
-            current[barcode] = {
-                "title":     title,
-                "url":       prod_url,
-                "price":     price,
-                "available": True,  # search hits are treated as available; no stock indicator on listing page
-            }
-
         if not current:
             log.warning("Kinokuniya: no products parsed — selectors may have changed")
             return state
+
+        log.info("Kinokuniya: %d unique product(s) across %d search term(s)", len(current), len(search_urls))
 
         prev      = state.get("kinokuniya", {})
         first_run = len(prev) == 0
