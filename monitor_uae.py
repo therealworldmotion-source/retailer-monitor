@@ -18,6 +18,7 @@ import platform
 import random
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -58,6 +59,25 @@ DISABLED_RETAILERS = {
     s.strip().lower() for s in os.environ.get("DISABLED_RETAILERS", "").split(",") if s.strip()
 }
 
+# ─── LORCANA GO-LIVE GATE ─────────────────────────────────────────────────────
+# The Lorcana watchers stay dormant until this moment, then switch on
+# automatically (checked in the monitor loop). Default: 2026-07-19 06:00 UTC
+# = 07:00 BST. Override via env LORCANA_GO_LIVE_UTC (ISO, e.g. 2026-07-19T06:00:00Z).
+def _parse_go_live() -> datetime:
+    raw = os.environ.get("LORCANA_GO_LIVE_UTC", "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            pass
+    return datetime(2026, 7, 24, 0, 0, 0, tzinfo=timezone.utc)  # already past — Lorcana live immediately
+
+LORCANA_GO_LIVE = _parse_go_live()
+
+def lorcana_active() -> bool:
+    """True once the clock passes the Lorcana go-live time (7am BST 2026-07-19)."""
+    return datetime.now(timezone.utc) >= LORCANA_GO_LIVE
+
 
 def _config_from_env() -> dict | None:
     """Build a config dict from environment variables (Railway / container deploys).
@@ -73,7 +93,7 @@ def _config_from_env() -> dict | None:
             "otakume": 60, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
@@ -95,6 +115,11 @@ def _config_from_env() -> dict | None:
             "kinokuniya_accented": "https://uae.kinokuniya.com/products?is_searching=true&keywords=Pok%C3%A9mon+tcg",
             # Curated Pokémon drop/event page(s). Comma-separate more IDs via env if needed.
             "kinokuniya_event": "https://uae.kinokuniya.com/events/1243",
+            # Lorcana search URLs (dormant until 7am BST 2026-07-19 via lorcana_active()).
+            "kinokuniya_lorcana": "https://uae.kinokuniya.com/products?is_searching=true&keywords=lorcana",
+            "virgin_lorcana_search": "https://www.virginmegastore.ae/en/search?text=lorcana",
+            "colorland_lorcana": "https://colorlandtoys.com/search?q=lorcana&options%5Bprefix%5D=last&type=product",
+            "toycorner_lorcana": "https://toycorner.ae/?s=lorcana&post_type=product",
         },
     }
     if os.environ.get("LEGENDS_AUTO_CHECKOUT", "").lower() == "true":
@@ -1493,6 +1518,353 @@ def _aed_val(price: str) -> float:
         return float("inf")
 
 
+# ─── LORCANA WATCHERS (all retailers, armed for a drop) ───────────────────────
+# Each retailer runs its own search for 'lorcana', filtered to titles containing
+# 'lorcana' (kills Disney-toy / sleeve noise), tracked in a separate state key.
+# Dormant until lorcana_active() (7am BST 2026-07-19), then armed: baseline once,
+# then alert on NEW products (a drop appearing) + restocks. A store showing 0 now
+# simply stays silent until real Lorcana shows up.
+
+LORCANA_ACCESSORY_WORDS = ("sleeve", "binder", "folio", "toploader", "top loader",
+                           "deck box", "playmat", "play mat", "card case")
+
+def _is_lorcana_product(title: str) -> bool:
+    tl = (title or "").lower()
+    if "lorcana" not in tl:
+        return False
+    if any(w in tl for w in LORCANA_ACCESSORY_WORDS):
+        return False
+    return True
+
+
+async def _lorcana_diff_and_alert(state: dict, client: httpx.AsyncClient,
+                                  state_key: str, headline: str, current: dict) -> None:
+    """Shared baseline + new/restock/OOS alerting for every Lorcana watcher.
+    Handles the empty-but-armed case (0 products) without spamming failures."""
+    started_key = f"_{state_key}_started"
+    prev = state.get(state_key, {})
+
+    if not state.get(started_key):
+        if current:
+            lines = [f"<b>{headline} — Monitoring Started ({len(current)} product{'s' if len(current)!=1 else ''})</b>"]
+            for p in current.values():
+                lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+            log.info("%s: baseline sent (%d products)", state_key, len(current))
+        else:
+            log.info("%s: armed — 0 Lorcana products yet", state_key)
+        state[started_key] = True
+    else:
+        new_products = [p for k, p in current.items() if k not in prev]
+        restocked    = [p for k, p in current.items() if k in prev and p.get("available") and not prev[k].get("available")]
+        went_oos     = [p for k, p in current.items() if k in prev and not p.get("available") and prev[k].get("available")]
+
+        if new_products:
+            lines = [f"<b>🆕 {headline} — {len(new_products)} New Lorcana Product(s)!</b>"]
+            for p in new_products:
+                lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+        if restocked:
+            lines = [f"<b>🟢 {headline} — Back In Stock!</b>"]
+            for p in restocked:
+                lines.append(fmt_product(p, "✅"))
+            await send_telegram("\n".join(lines), client)
+        if went_oos:
+            lines = [f"<b>🔴 {headline} — Out of Stock</b>"]
+            for p in went_oos:
+                lines.append(fmt_product(p, "❌"))
+            await send_telegram("\n".join(lines), client)
+        if not (new_products or restocked or went_oos):
+            log.info("%s: no changes (%d products)", state_key, len(current))
+
+    state[state_key] = current
+
+
+async def check_kinokuniya_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Kinokuniya (Lorcana)...")
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc); raise
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        async with AsyncSession(impersonate="safari17_0") as cf:
+            try:
+                await cf.get("https://uae.kinokuniya.com/", timeout=15)
+            except Exception:
+                pass
+            resp = await cf.get(URLS["kinokuniya_lorcana"],
+                                headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
+                                timeout=25)
+        if resp.status_code != 200:
+            log.warning("Kinokuniya Lorcana: HTTP %s", resp.status_code); return state
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for box in soup.select("div#image_or_detail div.box"):
+            link = box.select_one("a[href*='/bw/']")
+            if not link:
+                continue
+            m = re.search(r"/bw/(\d+)", link.get("href", ""))
+            if not m:
+                continue
+            bc = m.group(1)
+            te = box.select_one("span.title")
+            title = te.get_text(strip=True) if te else ""
+            if not _is_lorcana_product(title):
+                continue
+            pe = box.select_one(f"span#search_product_image_online_price_{bc}")
+            price = pe.get_text(strip=True) if pe else "N/A"
+            current[bc] = {"title": title, "url": f"https://uae.kinokuniya.com/bw/{bc}", "price": price, "available": True}
+        await _lorcana_diff_and_alert(state, client, "kinokuniya_lorcana", "🃏 KINOKUNIYA (LORCANA)", current)
+    except Exception as exc:
+        log.error("Kinokuniya Lorcana check failed: %s", exc)
+    return state
+
+
+async def check_virgin_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Virgin (Lorcana)...")
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc); raise
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        async with AsyncSession(impersonate="chrome") as cf:
+            try:
+                await cf.get("https://www.virginmegastore.ae/en/", timeout=15)
+            except Exception:
+                pass
+            resp = await cf.get(URLS["virgin_lorcana_search"],
+                                headers={"Referer": "https://www.virginmegastore.ae/en/"}, timeout=25)
+        if resp.status_code != 200:
+            log.warning("Virgin Lorcana: HTTP %s", resp.status_code); return state
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.select(".product-item"):
+            ne = item.select_one("a.product-list__name")
+            if not ne:
+                continue
+            title = ne.get_text(strip=True)
+            if not _is_lorcana_product(title):
+                continue
+            href = ne.get("href", "")
+            url  = href if href.startswith("http") else f"https://www.virginmegastore.ae{href}"
+            cur  = item.select_one(".price__currency")
+            num  = item.select_one(".gtm-price-number")
+            price = f"{cur.get_text(strip=True)} {num.get_text(strip=True)}" if cur and num else "N/A"
+            oos  = item.select_one("[class*='out-of-stock'], [class*='sold-out'], [class*='unavailable']")
+            current[product_key(title)] = {"title": title, "url": url, "price": price, "available": not oos}
+        await _lorcana_diff_and_alert(state, client, "virgin_lorcana", "🃏 VIRGIN (LORCANA)", current)
+    except Exception as exc:
+        log.error("Virgin Lorcana check failed: %s", exc)
+    return state
+
+
+async def check_magrudy_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Magrudy (Lorcana)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        resp = await client.post(
+            "https://www.magrudy.com/api/search/do-search",
+            json={"q": "lorcana", "stype": "item", "pagenum": 1, "pagesize": 80, "appliedFilters": {}, "sortOption": ""},
+            headers={"User-Agent": random.choice(USER_AGENTS), "Content-Type": "application/json",
+                     "Accept": "application/json", "Referer": "https://www.magrudy.com/search?q=lorcana",
+                     "Origin": "https://www.magrudy.com"},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            log.warning("Magrudy Lorcana: HTTP %s", resp.status_code); return state
+        for item in resp.json().get("data", []):
+            title = (item.get("title", "") or "").strip()
+            if not _is_lorcana_product(title):
+                continue
+            isbn = item.get("isbn", "")
+            pv   = item.get("unitPriceInclVAT", 0)
+            price = f"AED {pv:.0f}" if pv else "N/A"
+            url   = f"https://www.magrudy.com/product/{isbn}" if isbn else "https://www.magrudy.com/search?q=lorcana"
+            current[product_key(title)] = {"title": title, "url": url, "price": price, "available": True}
+        await _lorcana_diff_and_alert(state, client, "magrudy_lorcana", "🃏 MAGRUDY (LORCANA)", current)
+    except Exception as exc:
+        log.error("Magrudy Lorcana check failed: %s", exc)
+    return state
+
+
+async def check_legends_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Legends (Lorcana)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        offset = 0
+        while True:
+            api = (f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
+                   f"?keyword=lorcana&enabled=true&limit=100&offset={offset}&lang=en")
+            resp = await client.get(api, headers={"Authorization": f"Bearer {ECWID_TOKEN}",
+                                                  "Accept": "application/json",
+                                                  "User-Agent": random.choice(USER_AGENTS)}, timeout=25)
+            if resp.status_code != 200:
+                log.warning("Legends Lorcana: HTTP %s", resp.status_code)
+                if offset == 0:
+                    return state
+                break
+            data  = resp.json()
+            items = data.get("items", [])
+            total = data.get("total", 0)
+            for it in items:
+                name = it.get("name", "")
+                if not _is_lorcana_product(name):
+                    continue
+                current[product_key(name)] = {
+                    "title": name, "url": it.get("url", ""),
+                    "price": it.get("defaultDisplayedPriceFormatted", "N/A"),
+                    "available": bool(it.get("inStock", False)),
+                }
+            offset += len(items)
+            if not items or offset >= total:
+                break
+        await _lorcana_diff_and_alert(state, client, "legends_lorcana", "🃏 LEGENDS (LORCANA)", current)
+    except Exception as exc:
+        log.error("Legends Lorcana check failed: %s", exc)
+    return state
+
+
+async def check_shopify_suggest_lorcana(state: dict, client: httpx.AsyncClient, *,
+                                        domain: str, state_key: str, headline: str) -> dict:
+    """Generic Shopify search-suggest Lorcana watcher (Little Things, Otakume)."""
+    if not lorcana_active():
+        return state
+    log.info("Checking %s (Lorcana)...", state_key)
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        url = f"https://{domain}/search/suggest.json?q=lorcana&resources[type]=product&resources[limit]=10"
+        resp = await client.get(url, headers=get_json_headers(), timeout=20)
+        if resp.status_code != 200:
+            log.warning("%s Lorcana: HTTP %s", state_key, resp.status_code); return state
+        prods = (json.loads(resp.content).get("resources", {}).get("results", {}).get("products", []))
+        for p in prods:
+            title  = p.get("title", "")
+            handle = p.get("handle", "")
+            if not handle or not _is_lorcana_product(title):
+                continue
+            current[handle] = {
+                "title": title, "url": f"https://{domain}/products/{handle}",
+                "price": f"AED {p.get('price', '0')}", "available": bool(p.get("available")),
+            }
+        await _lorcana_diff_and_alert(state, client, state_key, headline, current)
+    except Exception as exc:
+        log.error("%s Lorcana check failed: %s", state_key, exc)
+    return state
+
+
+async def check_little_things_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    return await check_shopify_suggest_lorcana(
+        state, client, domain="littlethingsme.com",
+        state_key="little_things_lorcana", headline="🃏 LITTLE THINGS (LORCANA)")
+
+
+async def check_otakume_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    return await check_shopify_suggest_lorcana(
+        state, client, domain="otakume.com",
+        state_key="otakume_lorcana", headline="🃏 OTAKUME (LORCANA)")
+
+
+async def check_colorland_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Colorland (Lorcana)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        resp = await client.get(URLS["colorland_lorcana"], headers=get_headers("https://colorlandtoys.com/"), timeout=25)
+        if resp.status_code != 200:
+            log.warning("Colorland Lorcana: HTTP %s", resp.status_code); return state
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.select("div.product-item[data-json-product]"):
+            try:
+                data = json.loads(item["data-json-product"])
+            except Exception:
+                continue
+            handle = data.get("handle", "")
+            te = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
+            title = te.get_text(strip=True) if te else handle.replace("-", " ").title()
+            if not handle or not _is_lorcana_product(title):
+                continue
+            v = (data.get("variants") or [{}])[0]
+            available = bool(v.get("available", True))
+            pr = v.get("price", 0)
+            price = f"AED {int(pr) // 100}" if pr else "N/A"
+            current[handle] = {"title": title, "url": f"https://colorlandtoys.com/products/{handle}",
+                               "price": price, "available": available}
+        await _lorcana_diff_and_alert(state, client, "colorland_lorcana", "🃏 COLORLAND (LORCANA)", current)
+    except Exception as exc:
+        log.error("Colorland Lorcana check failed: %s", exc)
+    return state
+
+
+async def check_toycorner_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    if not lorcana_active():
+        return state
+    log.info("Checking Toy Corner (Lorcana)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        resp = await client.get(URLS["toycorner_lorcana"], headers=get_headers("https://toycorner.ae/"),
+                                timeout=25, follow_redirects=True)
+        if resp.status_code != 200:
+            log.warning("Toy Corner Lorcana: HTTP %s", resp.status_code); return state
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.find_all(attrs={"class": lambda c: c and "type-product" in c}):
+            classes = " ".join(item.get("class", []))
+            m = re.search(r"post-(\d+)", classes)
+            if not m:
+                continue
+            pid = m.group(1)
+            te = item.select_one(".product-title") or item.select_one("h2") or item.select_one("h3")
+            title = te.get_text(strip=True) if te else ""
+            if not title:
+                img = item.find("img")
+                title = (img.get("alt") if img else "") or ""
+            if not _is_lorcana_product(title):
+                continue
+            available = ("instock" in classes) and ("outofstock" not in classes)
+            a = item.find("a", href=re.compile(r"/product/"))
+            url = a["href"] if a else f"https://toycorner.ae/?p={pid}"
+            pe = item.select_one(".price")
+            price = "N/A"
+            if pe:
+                tg = pe.find("ins") or pe
+                ae = tg.select_one(".woocommerce-Price-amount bdi") or tg.select_one(".woocommerce-Price-amount")
+                if ae:
+                    price = f"AED {ae.get_text(strip=True)}"
+            current[pid] = {"title": title, "url": url, "price": price, "available": available}
+        await _lorcana_diff_and_alert(state, client, "toycorner_lorcana", "🃏 TOY CORNER (LORCANA)", current)
+    except Exception as exc:
+        log.error("Toy Corner Lorcana check failed: %s", exc)
+    return state
+
+
+# Dispatch table — (state_key, checker, status-board label). Driven in monitor_loop.
+LORCANA_CHECKS = [
+    ("kinokuniya_lorcana",    check_kinokuniya_lorcana,    "🃏 Kino (Lorcana)"),
+    ("virgin_lorcana",        check_virgin_lorcana,        "🃏 Virgin (Lorcana)"),
+    ("magrudy_lorcana",       check_magrudy_lorcana,       "🃏 Magrudy (Lorcana)"),
+    ("legends_lorcana",       check_legends_lorcana,       "🃏 Legends (Lorcana)"),
+    ("little_things_lorcana", check_little_things_lorcana, "🃏 LittleThings (Lorcana)"),
+    ("otakume_lorcana",       check_otakume_lorcana,       "🃏 Otakume (Lorcana)"),
+    ("colorland_lorcana",     check_colorland_lorcana,     "🃏 Colorland (Lorcana)"),
+    ("toycorner_lorcana",     check_toycorner_lorcana,     "🃏 ToyCorner (Lorcana)"),
+]
+
+
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -2199,9 +2571,14 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
         "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
     }
+    # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
+    for _sk, _fn, _label in LORCANA_CHECKS:
+        CHECK_STATUS[_sk] = {"label": _label, "ok": None, "time": ""}
+
     status_msg_id: int | None = state.get("status_msg_id")
 
     HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event"}
+    HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
     def _fmt_status() -> str:
@@ -2259,6 +2636,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
     last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = 0.0
+    last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
+    lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
 
     headless_context = await make_browser_context(headless_browser)
@@ -2376,6 +2755,23 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("kinokuniya_event", check_kinokuniya_event(state, client)))
                 last_kinokuniya_event = now
 
+            # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
+            if lorcana_active():
+                if not lorcana_announced and not state.get("_lorcana_announced"):
+                    await send_telegram(
+                        "<b>🃏 LORCANA WATCH IS NOW LIVE</b>\n\n"
+                        "Now watching all UAE retailers for Disney Lorcana. "
+                        "You'll get an alert the moment products appear or restock.",
+                        client,
+                    )
+                    lorcana_announced = True
+                    state["_lorcana_announced"] = True
+                    save_state(state)
+                for _sk, _fn, _label in LORCANA_CHECKS:
+                    if _sk not in DISABLED_RETAILERS and now - last_lorcana.get(_sk, 0.0) >= INTERVALS.get("lorcana", 120):
+                        headless_tasks.append((_sk, _fn(state, client)))
+                        last_lorcana[_sk] = now
+
             if headless_tasks:
                 log.info("Running %d headless checks concurrently...", len(headless_tasks))
                 results = await asyncio.gather(*[t[1] for t in headless_tasks], return_exceptions=True)
@@ -2386,7 +2782,13 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                         await _track_failure(site_name, str(result))
                     else:
                         state = result
-                        _mark(site_name, bool(state.get(site_name)))
+                        # Lorcana watchers are healthy once they've run once, even
+                        # with 0 products (armed-but-empty is a valid state).
+                        if site_name.endswith("_lorcana"):
+                            ok = bool(state.get(f"_{site_name}_started"))
+                        else:
+                            ok = bool(state.get(site_name))
+                        _mark(site_name, ok)
                         _track_success(site_name)
                 save_state(state)
                 await _push_status()
@@ -2475,8 +2877,11 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
                         f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n"
-                        f"🎴 Kinokuniya Event: every {INTERVALS.get('kinokuniya_event', 120) // 60} min\n\n"
-                        "Send <code>stop</code> to pause.",
+                        f"🎴 Kinokuniya Event: every {INTERVALS.get('kinokuniya_event', 120) // 60} min\n"
+                        + (f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n\n"
+                           if lorcana_active() else
+                           f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): armed, activates {LORCANA_GO_LIVE:%H:%M UTC %d %b}\n\n")
+                        + "Send <code>stop</code> to pause.",
                         client,
                     )
                     log.info("Monitor started via Telegram")
