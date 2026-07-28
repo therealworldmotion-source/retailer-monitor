@@ -97,7 +97,7 @@ def _config_from_env() -> dict | None:
             "kinokuniya": 120, "kinokuniya_event": 120, "lorcana": 120,
         },
         "urls": {
-            "otakume": "https://otakume.com/collections/trading-cards?filter.v.price.gte=&filter.v.price.lte=&filter.p.m.custom.manufacturer=Pokemon+Company",
+            "otakume": "https://otakume.com/collections/pokemon",
             "virgin_megastore": "https://www.virginmegastore.ae/en/selection/general-merchandise/pokemon-merchandise/pokemon-tcg/c/n9992162",
             "virgin_megastore_search": "https://www.virginmegastore.ae/en/search?text=pokemon+tcg",
             "virgin_megastore_accented": "https://www.virginmegastore.ae/en/search?text=Pok%C3%A9mon+tcg",
@@ -483,27 +483,42 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
     try:
         await asyncio.sleep(random.uniform(1.5, 4))
-        resp = await client.get(
-            URLS["otakume"],
-            headers={
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-GB,en;q=0.9",
-            },
-            timeout=25,
-        )
 
-        if resp.status_code != 200:
-            log.warning("Otakume returned HTTP %s", resp.status_code)
-            return state
+        # Otakume paginates at 16 products/page, so page 1 alone misses most of
+        # the collection. Walk pages until one yields nothing new.
+        product_links = []
+        seen_hrefs: set[str] = set()
+        for page_num in range(1, 8):  # safety cap
+            page_url = URLS["otakume"] if page_num == 1 else f"{URLS['otakume']}?page={page_num}"
+            resp = await client.get(
+                page_url,
+                headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                },
+                timeout=25,
+            )
 
-        page_text = resp.text
-        log.info("Otakume: response %d chars, encoding=%s", len(page_text), resp.encoding)
-        soup = BeautifulSoup(page_text, "html.parser")
+            if resp.status_code != 200:
+                log.warning("Otakume returned HTTP %s on page %d", resp.status_code, page_num)
+                if page_num == 1:
+                    return state
+                break
 
-        # Find product links (Otakume product URLs)
-        product_links = soup.select("a[href*='/products/']")
-        log.info("Otakume: found %d product links", len(product_links))
+            if page_num == 1:
+                log.info("Otakume: response %d chars, encoding=%s", len(resp.text), resp.encoding)
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            page_links = soup.select("a[href*='/products/']")
+            fresh = [a for a in page_links if a.get("href", "") not in seen_hrefs]
+            if not fresh:
+                break
+            seen_hrefs.update(a.get("href", "") for a in fresh)
+            product_links.extend(fresh)
+            await asyncio.sleep(random.uniform(1, 2))
+
+        log.info("Otakume: found %d product links across %d page(s)", len(product_links), page_num)
 
         for item in product_links:
             # Title from image alt attribute
