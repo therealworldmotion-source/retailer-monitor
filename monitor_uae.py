@@ -18,6 +18,7 @@ import platform
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -440,6 +441,24 @@ async def poll_telegram(offset: int, client: httpx.AsyncClient) -> list:
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
+def strip_accents(text: str) -> str:
+    """Lowercase and strip diacritics: 'Pokémon' → 'pokemon'.
+
+    Retailers list the same product both ways ('Pokemon TCG …' and
+    'Pokémon TCG …'), so every title match must normalise first or the
+    accented spelling is silently dropped."""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", (text or "").lower())
+        if unicodedata.category(ch) != "Mn"
+    )
+
+
+def is_pokemon_title(title: str) -> bool:
+    """True if a product title looks like a Pokemon product (accent-insensitive)."""
+    t = strip_accents(title)
+    return "pokemon" in t or "pikachu" in t
+
+
 def product_key(title: str) -> str:
     """Normalise a product title to a stable dictionary key."""
     return title.lower().strip().replace(" ", "-").replace("/", "-")[:80]
@@ -661,7 +680,7 @@ async def check_virgin_megastore(
 
                     # Strip search noise: on keyword-search pages keep only
                     # titles matching the filter (category pages keep all).
-                    if is_search and keyword_filter and keyword_filter not in title.lower():
+                    if is_search and keyword_filter and keyword_filter not in strip_accents(title):
                         continue
 
                     href = name_el.get("href", "")
@@ -1529,7 +1548,7 @@ LORCANA_ACCESSORY_WORDS = ("sleeve", "binder", "folio", "toploader", "top loader
                            "deck box", "playmat", "play mat", "card case")
 
 def _is_lorcana_product(title: str) -> bool:
-    tl = (title or "").lower()
+    tl = strip_accents(title)
     if "lorcana" not in tl:
         return False
     if any(w in tl for w in LORCANA_ACCESSORY_WORDS):
@@ -2205,8 +2224,8 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                 title = p.get("title", "")
                 if not handle or not title or len(title) < 3:
                     continue
-                # Skip non-Pokemon products
-                if "pokemon" not in title.lower() and "pikachu" not in title.lower():
+                # Skip non-Pokemon products (accent-insensitive: 'Pokémon' counts)
+                if not is_pokemon_title(title):
                     continue
                 variants = p.get("variants", [{}])
                 v = variants[0] if variants else {}
@@ -2256,8 +2275,8 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                         continue
                     if handle in current:
                         continue  # already have full variant data from the collection
-                    tl = title.lower()
-                    if "pokemon" not in tl and "pikachu" not in tl:
+                    tl = strip_accents(title)
+                    if not is_pokemon_title(title):
                         continue
                     # Search-sourced items must look like TCG — the search also
                     # surfaces Pokemon figures/Lego/Funko which we don't track.
