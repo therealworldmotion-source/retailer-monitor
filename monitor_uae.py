@@ -1066,6 +1066,13 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
                     if not title or len(title) < 3:
                         continue
 
+                    # Colorland's search uses options[prefix]=last, which is fuzzy
+                    # enough to return ~353 products (Uno, VTech Paw Patrol, board
+                    # games). Keep only Pokemon titles or the non-Pokemon items
+                    # flap in/out of stock and spam alerts.
+                    if not is_pokemon_title(title):
+                        continue
+
                     prod_url = f"https://colorlandtoys.com/products/{handle}"
                     current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
 
