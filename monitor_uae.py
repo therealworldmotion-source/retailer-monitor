@@ -1095,6 +1095,9 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
             "pokemon-my-partner-pikachu-pkw0030",
             "vtech-paw-patrol-learning-watch-chase-80-551603",
             "vtech-paw-patrol-learning-watch-marshall-80-551663",
+            # Uno DOS — flaps in/out of stock constantly, not Pokemon TCG anyway
+            "uno-dos-refresh-card-game-hnn01",
+            "uno-dos-card-game-frm36",
         }
 
         # Send startup summary on first check of each session
