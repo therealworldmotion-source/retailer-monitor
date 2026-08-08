@@ -91,7 +91,7 @@ def _config_from_env() -> dict | None:
         "telegram_bot_token": token,
         "telegram_chat_id": chat,
         "intervals": {
-            "otakume": 60, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
+            "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
             "kinokuniya": 120, "kinokuniya_event": 120, "lorcana": 120,
@@ -501,24 +501,36 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
         # Otakume paginates at 16 products/page, so page 1 alone misses most of
         # the collection. Walk pages until one yields nothing new.
+        # partial=True means a page failed mid-walk (Otakume 503s under our
+        # cadence) — the scrape is incomplete, so downstream must NOT treat
+        # missing products as gone, and must NOT baseline from it (a partial
+        # baseline makes the next clean scrape re-alert everything it missed).
         product_links = []
         seen_hrefs: set[str] = set()
+        partial = False
         for page_num in range(1, 8):  # safety cap
             page_url = URLS["otakume"] if page_num == 1 else f"{URLS['otakume']}?page={page_num}"
-            resp = await client.get(
-                page_url,
-                headers={
-                    "User-Agent": random.choice(USER_AGENTS),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                },
-                timeout=25,
-            )
+
+            resp = None
+            for attempt in range(2):  # one retry on transient 5xx
+                resp = await client.get(
+                    page_url,
+                    headers={
+                        "User-Agent": random.choice(USER_AGENTS),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-GB,en;q=0.9",
+                    },
+                    timeout=25,
+                )
+                if resp.status_code == 200 or resp.status_code < 500:
+                    break
+                await asyncio.sleep(random.uniform(4, 7))
 
             if resp.status_code != 200:
                 log.warning("Otakume returned HTTP %s on page %d", resp.status_code, page_num)
                 if page_num == 1:
                     return state
+                partial = True
                 break
 
             if page_num == 1:
@@ -533,7 +545,8 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
             product_links.extend(fresh)
             await asyncio.sleep(random.uniform(1, 2))
 
-        log.info("Otakume: found %d product links across %d page(s)", len(product_links), page_num)
+        log.info("Otakume: found %d product links across %d page(s)%s",
+                 len(product_links), page_num, " [PARTIAL]" if partial else "")
 
         for item in product_links:
             # Title from image alt attribute
@@ -574,6 +587,13 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
         prev = state.get("otakume", {})
         first_run = len(prev) == 0
+
+        # Never baseline from an incomplete walk: products on the failed pages
+        # would be absent from state and re-alert as "new" on the next clean
+        # scrape. Wait for a complete pass instead.
+        if first_run and partial:
+            log.warning("Otakume: partial scrape on first run — deferring baseline until a clean pass")
+            return state
 
         if first_run:
             in_stock  = [v for v in current.values() if v["available"]]
@@ -635,12 +655,14 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
         # OTAKUME_MISS_GRACE consecutive misses before treating them as truly
         # delisted — after that, a reappearance is a genuine relist (Otakume
         # delists on sellout, so relist = restock) and SHOULD alert.
-        OTAKUME_MISS_GRACE = 30  # checks (~30-45 min at 60s cadence)
+        OTAKUME_MISS_GRACE = 30  # complete checks (~30-60 min)
         merged = dict(current)
         for pid, prod in prev.items():
             if pid in current:
                 continue
-            misses = prod.get("_misses", 0) + 1
+            # Only age misses on a COMPLETE scrape — on a partial one the
+            # product may simply be on a page that 503'd, so carry unchanged.
+            misses = prod.get("_misses", 0) + (0 if partial else 1)
             if misses <= OTAKUME_MISS_GRACE:
                 kept = dict(prod)
                 kept["_misses"] = misses
