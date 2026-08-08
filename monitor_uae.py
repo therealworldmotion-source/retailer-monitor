@@ -455,7 +455,7 @@ def strip_accents(text: str) -> str:
 
 # Brands/product lines Gurps never wants alerts for (accessories, figures,
 # model kits — not sealed TCG). Matched accent-insensitively as substrings.
-EXCLUDED_TITLE_WORDS = ("evoretro", "blokees", "funko", "plamo")
+EXCLUDED_TITLE_WORDS = ("evoretro", "blokees", "funko", "plamo", "takara tomy")
 
 
 def title_excluded(title: str) -> bool:
