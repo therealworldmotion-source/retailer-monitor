@@ -610,7 +610,28 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
             if not (new_products or restocked or went_oos):
                 log.info("Otakume: no changes")
 
-        state["otakume"] = current
+        # Grace window for scrape flicker: Otakume's CDN intermittently serves
+        # page variants missing a product, so a product can vanish from one
+        # check and return the next. If we dropped it from state immediately,
+        # every return would re-alert as "new" (observed: Pitch Black Booster
+        # Bundle re-pinging all morning). Keep missing products in state for
+        # OTAKUME_MISS_GRACE consecutive misses before treating them as truly
+        # delisted — after that, a reappearance is a genuine relist (Otakume
+        # delists on sellout, so relist = restock) and SHOULD alert.
+        OTAKUME_MISS_GRACE = 30  # checks (~30-45 min at 60s cadence)
+        merged = dict(current)
+        for pid, prod in prev.items():
+            if pid in current:
+                continue
+            misses = prod.get("_misses", 0) + 1
+            if misses <= OTAKUME_MISS_GRACE:
+                kept = dict(prod)
+                kept["_misses"] = misses
+                merged[pid] = kept
+            # else: drop for real — gone long enough to be a true delist
+        # Products present this check reset their miss counter implicitly
+        # (fresh dicts from current have no _misses key).
+        state["otakume"] = merged
 
     except Exception as exc:
         log.error("Otakume check failed: %s", exc)
