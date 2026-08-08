@@ -453,9 +453,24 @@ def strip_accents(text: str) -> str:
     )
 
 
-def is_pokemon_title(title: str) -> bool:
-    """True if a product title looks like a Pokemon product (accent-insensitive)."""
+# Brands/product lines Gurps never wants alerts for (accessories, figures,
+# model kits — not sealed TCG). Matched accent-insensitively as substrings.
+EXCLUDED_TITLE_WORDS = ("evoretro", "blokees", "funko", "plamo")
+
+
+def title_excluded(title: str) -> bool:
+    """True if the title contains an excluded brand (EVORETRO cases, Blokees,
+    Funko figures, Plamo model kits)."""
     t = strip_accents(title)
+    return any(w in t for w in EXCLUDED_TITLE_WORDS)
+
+
+def is_pokemon_title(title: str) -> bool:
+    """True if a product title looks like a Pokemon product (accent-insensitive),
+    excluding blocked brands (EVORETRO/Blokees/Funko/Plamo)."""
+    t = strip_accents(title)
+    if any(w in t for w in EXCLUDED_TITLE_WORDS):
+        return False
     return "pokemon" in t or "pikachu" in t
 
 
@@ -525,6 +540,8 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
             img = item.select_one("img")
             title = img.get("alt", "") if img else ""
             if not title or len(title) < 3:
+                continue
+            if title_excluded(title):
                 continue
 
             # Product URL
@@ -712,6 +729,8 @@ async def check_virgin_megastore(
                         continue
                     title = name_el.get_text(strip=True)
                     if not title or len(title) < 3:
+                        continue
+                    if title_excluded(title):
                         continue
 
                     # Strip search noise: on keyword-search pages keep only
@@ -1239,6 +1258,8 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
                     title = (img.get("alt") if img else "") or ""
                 if not title or len(title) < 3:
                     continue
+                if title_excluded(title):
+                    continue
 
                 # URL
                 a = item.find("a", href=re.compile(r"/product/"))
@@ -1398,6 +1419,8 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                     title = title_el.get_text(strip=True) if title_el else ""
                     if not title or len(title) < 3:
                         continue
+                    if title_excluded(title):
+                        continue
 
                     price_el = box.select_one(f"span#search_product_image_online_price_{barcode}")
                     price = price_el.get_text(strip=True) if price_el else "N/A"
@@ -1501,6 +1524,8 @@ async def check_kinokuniya_event(state: dict, client: httpx.AsyncClient) -> dict
             txt = a.get_text(" ", strip=True)
             img = a.select_one("img")
             title = txt or (img.get("alt", "") if img else "")
+            if title and title_excluded(title):
+                continue
 
             # Price: search this link's ancestors for an AED amount
             price = "N/A"
@@ -1973,6 +1998,8 @@ async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
             title = item.get("title", "").strip()
             if not title or len(title) < 3:
                 continue
+            if title_excluded(title):
+                continue
             isbn      = item.get("isbn", "")
             price_val = item.get("unitPriceInclVAT", 0)
             price     = f"AED {price_val:.0f}" if price_val else "N/A"
@@ -2054,6 +2081,8 @@ async def check_zgames(state: dict, client: httpx.AsyncClient, context: BrowserC
                     continue
                 title = title_el.get_text(strip=True)
                 if not title or len(title) < 3:
+                    continue
+                if title_excluded(title):
                     continue
 
                 href = title_el.get("href", "")
@@ -2169,6 +2198,8 @@ async def check_geekay(state: dict, client: httpx.AsyncClient) -> dict:
                 continue
             title = title_el.get_text(strip=True)
             if not title or len(title) < 3:
+                continue
+            if title_excluded(title):
                 continue
 
             href = title_el.get("href", "")
