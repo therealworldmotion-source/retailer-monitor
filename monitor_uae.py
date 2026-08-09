@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -105,6 +105,10 @@ def _config_from_env() -> dict | None:
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
+            # ELC Toys — Shopify. 'POKEMON TCG' returns just the TCG SKUs;
+            # a broader 'pokemon' search floods with plushes/figures.
+            "elctoys": "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product",
+            "elctoys_accented": "https://elctoys.com/search?q=Pok%C3%A9mon+TCG&options%5Bprefix%5D=last&type=product",
             "magrudy": "https://www.magrudy.com/search?q=tcg",
             "zgames": "https://zgames.ae/catalogsearch/result/?q=pokemon+tcg",
             "zgames_accented": "https://zgames.ae/catalogsearch/result/?q=Pok%C3%A9mon+tcg",
@@ -249,6 +253,7 @@ def load_state() -> dict:
         "toycorner":            {},
         "kinokuniya":           {},
         "kinokuniya_event":     {},
+        "elctoys":              {},
     }
 
 
@@ -1977,6 +1982,168 @@ LORCANA_CHECKS = [
 ]
 
 
+# ─── ELC TOYS ─────────────────────────────────────────────────────────────────
+
+# ELC's catalogue is mostly plushes/figures, so search hits must look like TCG.
+ELC_TCG_HINTS = ("tcg", "booster", "elite trainer", "etb", "blister", "deck",
+                 "tin", "collection box", "premium collection", "trading card")
+
+
+async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
+    """ELC Toys — Shopify store, same server-rendered data-json-product markup
+    as Colorland. Searches the plain + accented 'POKEMON TCG' terms and merges
+    by handle. Captures variant IDs so alerts carry a tap-to-checkout cart
+    permalink (https://elctoys.com/cart/{variant_id}:1)."""
+    log.info("Checking ELC Toys...")
+    current: dict[str, dict] = {}
+
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        bases = [URLS["elctoys"], URLS.get("elctoys_accented")]
+        bases = [b for b in bases if b]
+        fetch_error = False
+
+        for base in bases:
+            page_num = 1
+            while page_num <= 8:  # safety cap
+                url = base if page_num == 1 else f"{base}&page={page_num}"
+                resp = await client.get(
+                    url,
+                    headers=get_headers("https://elctoys.com/"),
+                    timeout=25,
+                )
+                if resp.status_code == 429:
+                    log.warning("ELC Toys: rate limited on page %d — waiting 30s", page_num)
+                    await asyncio.sleep(30)
+                    resp = await client.get(url, headers=get_headers("https://elctoys.com/"), timeout=25)
+                if resp.status_code != 200:
+                    log.warning("ELC Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
+                    fetch_error = True
+                    break
+
+                soup  = BeautifulSoup(resp.text, "html.parser")
+                items = soup.select("div.product-item[data-json-product]")
+                log.info("ELC Toys: page %d — %d items", page_num, len(items))
+                if not items:
+                    break
+
+                for item in items:
+                    try:
+                        data = json.loads(item["data-json-product"])
+                    except Exception:
+                        continue
+
+                    handle = data.get("handle", "")
+                    if not handle:
+                        continue
+
+                    title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
+                    title    = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
+                    if not title or len(title) < 3:
+                        continue
+
+                    # Pokemon only, and TCG only — ELC is heavy on plushes/figures
+                    if not is_pokemon_title(title):
+                        continue
+                    if not any(h in strip_accents(title) for h in ELC_TCG_HINTS):
+                        continue
+
+                    variants   = data.get("variants") or [{}]
+                    v          = variants[0]
+                    available  = any(var.get("available") for var in variants)
+                    avail_var  = next((var for var in variants if var.get("available")), v)
+                    variant_id = avail_var.get("id") or v.get("id")
+
+                    price_raw = v.get("price", 0)
+                    try:
+                        price = f"AED {int(price_raw) / 100:.2f}" if price_raw else "N/A"
+                    except Exception:
+                        price = "N/A"
+
+                    current[handle] = {
+                        "title": title,
+                        "url": f"https://elctoys.com/products/{handle}",
+                        "price": price,
+                        "available": available,
+                        "variant_id": variant_id,
+                    }
+
+                if len(items) < 15:
+                    break  # last page
+                page_num += 1
+                await asyncio.sleep(random.uniform(2, 4))
+
+            if fetch_error:
+                break
+            await asyncio.sleep(random.uniform(1, 2))
+
+        if fetch_error:
+            log.warning("ELC Toys: fetch error — state not updated")
+            return state
+        if not current:
+            log.warning("ELC Toys: no Pokemon TCG products parsed")
+            return state
+
+        log.info("ELC Toys: %d Pokemon TCG product(s)", len(current))
+
+        prev      = state.get("elctoys", {})
+        first_run = len(prev) == 0
+
+        def _cart_line(p: dict) -> str:
+            if p.get("available") and p.get("variant_id"):
+                return f'\n  <a href="https://elctoys.com/cart/{p["variant_id"]}:1">🛒 Tap to checkout</a>'
+            return ""
+
+        if first_run:
+            in_stock  = [v for v in current.values() if v["available"]]
+            out_stock = [v for v in current.values() if not v["available"]]
+            lines = [f"<b>🧸 ELC TOYS — Monitoring Started ({len(current)} products)</b>"]
+            if in_stock:
+                lines.append("\n✅ <b>In Stock:</b>")
+                for p in in_stock:
+                    lines.append(fmt_product(p) + _cart_line(p))
+            if out_stock:
+                lines.append("\n❌ <b>Out of Stock:</b>")
+                for p in out_stock:
+                    lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+            log.info("ELC Toys: baseline sent (%d products)", len(current))
+        else:
+            new_products, restocked, went_oos = [], [], []
+            for pid, prod in current.items():
+                if pid not in prev:
+                    new_products.append(prod)
+                elif prod["available"] != prev[pid].get("available"):
+                    (restocked if prod["available"] else went_oos).append(prod)
+
+            if new_products:
+                lines = [f"<b>🆕 ELC TOYS — {len(new_products)} New Product(s)!</b>"]
+                for p in new_products:
+                    lines.append(fmt_product(p) + _cart_line(p))
+                await send_telegram("\n".join(lines), client)
+            if restocked:
+                lines = ["<b>🟢 ELC TOYS — Back In Stock!</b>"]
+                for p in restocked:
+                    lines.append(fmt_product(p, "✅") + _cart_line(p))
+                await send_telegram("\n".join(lines), client)
+            if went_oos:
+                lines = ["<b>🔴 ELC TOYS — Out of Stock</b>"]
+                for p in went_oos:
+                    lines.append(fmt_product(p, "❌"))
+                await send_telegram("\n".join(lines), client)
+            if not (new_products or restocked or went_oos):
+                log.info("ELC Toys: no changes")
+
+        merged = state.get("elctoys", {})
+        merged.update(current)
+        state["elctoys"] = merged
+
+    except Exception as exc:
+        log.error("ELC Toys check failed: %s", exc)
+
+    return state
+
+
 # ─── MAGRUDY ──────────────────────────────────────────────────────────────────
 
 async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
@@ -2671,6 +2838,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     state["_toycorner_startup_sent"] = False
     state["kinokuniya"]            = {}
     state["kinokuniya_event"]      = {}
+    state["elctoys"]               = {}
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -2688,6 +2856,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
         "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
+        "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -2695,7 +2864,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -2753,7 +2922,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -2872,6 +3041,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kinokuniya_event >= INTERVALS.get("kinokuniya_event", 120):
                 headless_tasks.append(("kinokuniya_event", check_kinokuniya_event(state, client)))
                 last_kinokuniya_event = now
+
+            if "elctoys" not in DISABLED_RETAILERS and now - last_elctoys >= INTERVALS.get("elctoys", 120):
+                headless_tasks.append(("elctoys", check_elctoys(state, client)))
+                last_elctoys = now
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
