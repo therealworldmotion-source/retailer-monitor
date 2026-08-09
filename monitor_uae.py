@@ -258,7 +258,64 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Atomic write: a SIGKILL mid-write previously truncated state_uae.json,
+    which load_state silently swallowed → every retailer re-baselined."""
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        log.error("save_state failed: %s", exc)
+
+
+# ─── EVENT LOG (drop-timing history) ──────────────────────────────────────────
+# Append-only JSONL on the persistent volume. Railway log retention is short and
+# per-deployment, so stock history is otherwise destroyed on every redeploy.
+# One line per stock change → lets us learn each store's upload window.
+
+EVENTS_FILE = DATA_DIR / "events.jsonl"
+
+
+def log_event(site: str, kind: str, product: dict) -> None:
+    """Record a stock change. kind: new | restock | oos.
+    Never raises — telemetry must never break a check."""
+    try:
+        rec = {
+            "ts":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "site":   site,
+            "kind":   kind,
+            "title":  (product.get("title") or "")[:120],
+            "price":  product.get("price"),
+            "url":    product.get("url"),
+        }
+        with EVENTS_FILE.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as exc:
+        log.debug("log_event failed: %s", exc)
+
+
+def log_events(site: str, kind: str, products: list) -> None:
+    for p in products or []:
+        log_event(site, kind, p)
+
+
+# ─── HONEST HEALTH SIGNAL ─────────────────────────────────────────────────────
+# Previously health was `bool(state[site])`, which stays truthy forever once a
+# site has baselined — so a store blind for a week still showed ✅ with a fresh
+# timestamp (exactly how Otakume's dead filter went unnoticed for hours).
+# Checkers now stamp a success time; "healthy" means *succeeded recently*.
+
+def mark_ok(state: dict, site: str) -> None:
+    """Called by a checker only when it actually completed and parsed products."""
+    state.setdefault("_last_ok", {})[site] = time.time()
+
+
+def check_is_stale(state: dict, site: str, interval: float) -> bool:
+    """True if the site hasn't had a successful check in 3x its poll interval."""
+    last = (state.get("_last_ok") or {}).get(site)
+    if last is None:
+        return False  # never succeeded yet — don't cry wolf during first pass
+    return (time.time() - last) > max(3 * interval, 300)
 
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -382,49 +439,90 @@ async def edit_telegram(message_id: int, message: str, client: httpx.AsyncClient
         return False
 
 
-async def run_watchdog(monitor_task: "asyncio.Task[None]", client: httpx.AsyncClient) -> None:
+async def run_watchdog(holder: dict, client: httpx.AsyncClient, respawn=None) -> None:
     """
-    Runs alongside monitor_loop.
-    • If the heartbeat goes stale > 10 min  → "not responding" alert
-    • If the task crashes with an exception  → "crashed" alert
+    Runs alongside monitor_loop. holder["task"] is the live monitor task, so the
+    watchdog keeps watching across self-heal restarts.
+
+    • Heartbeat stale > 10 min → alert AND auto-restart the loop
+    • Task crashes            → alert AND auto-restart the loop
+
+    Previously it only *told* the user to send stop/start, which meant a 3am
+    stall or crash left the monitor dead until a human intervened. With respawn
+    supplied it now recovers itself, backing off on repeated failures.
     """
     STALE_THRESHOLD = 600   # 10 minutes
     CHECK_EVERY     = 120   # check every 2 minutes
     alert_sent      = False
+    restarts        = 0
+    MAX_RESTARTS    = 5     # then stop trying and leave the alert standing
+
+    async def _self_heal(reason: str) -> bool:
+        nonlocal restarts
+        if respawn is None or restarts >= MAX_RESTARTS:
+            return False
+        restarts += 1
+        old = holder.get("task")
+        if old and not old.done():
+            old.cancel()
+            try:
+                await old
+            except (asyncio.CancelledError, Exception):
+                pass
+        HEARTBEAT["last"] = 0.0
+        holder["task"] = respawn()
+        log.warning("Watchdog self-heal #%d (%s) — monitor restarted", restarts, reason)
+        await send_telegram(
+            f"🔄 <b>Monitor auto-restarted</b> ({reason})\n\n"
+            f"Recovery attempt {restarts}/{MAX_RESTARTS}. No action needed.",
+            client,
+        )
+        return True
 
     # Grace period — let the loop start up before we start watching
     await asyncio.sleep(60)
 
-    while not monitor_task.done():
+    while True:
         await asyncio.sleep(CHECK_EVERY)
+        task = holder.get("task")
+
+        # ── Task died? ────────────────────────────────────────────────────
+        if task is None or task.done():
+            if task is not None and not task.cancelled():
+                try:
+                    exc = task.exception()
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    exc = None
+                if exc:
+                    await send_telegram(
+                        f"🚨 <b>Monitor crashed!</b>\n\n"
+                        f"<code>{type(exc).__name__}: {exc}</code>",
+                        client,
+                    )
+                    if await _self_heal("crash"):
+                        continue
+                    await send_telegram(
+                        "❗ Auto-restart limit reached. Send <code>start</code> to retry.", client
+                    )
+            return  # stopped deliberately, or we've given up
+
+        # ── Heartbeat stale? ──────────────────────────────────────────────
         age = time.monotonic() - HEARTBEAT["last"]
         if HEARTBEAT["last"] > 0 and age > STALE_THRESHOLD:
             if not alert_sent:
                 await send_telegram(
                     "🚨 <b>Monitor is not responding!</b>\n\n"
-                    "The loop has been silent for over 10 minutes.\n"
-                    "Send <code>stop</code> then <code>start</code> to restart.",
+                    "The loop has been silent for over 10 minutes — restarting it now.",
                     client,
                 )
                 alert_sent = True
+            if await _self_heal("stalled"):
+                alert_sent = False
+                continue
         else:
             if alert_sent:
                 await send_telegram("✅ <b>Monitor has recovered.</b>", client)
             alert_sent = False
-
-    # Task finished — check if it died with an uncaught exception
-    if not monitor_task.cancelled():
-        try:
-            exc = monitor_task.exception()
-            if exc:
-                await send_telegram(
-                    f"🚨 <b>Monitor crashed!</b>\n\n"
-                    f"<code>{type(exc).__name__}: {exc}</code>\n\n"
-                    "Send <code>start</code> to restart.",
-                    client,
-                )
-        except (asyncio.CancelledError, asyncio.InvalidStateError):
-            pass
 
 
 async def poll_telegram(offset: int, client: httpx.AsyncClient) -> list:
@@ -586,6 +684,7 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
         if not current:
             log.warning("Otakume: no products found — page may have changed")
             return state
+        mark_ok(state, "otakume")
 
         log.info("Otakume: products found: %s",
                  ", ".join(p["title"] for p in current.values()))
@@ -636,18 +735,21 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("otakume", "new", new_products)
 
             if restocked:
                 lines = ["<b>🟢 OTAKUME — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+                log_events("otakume", "restock", restocked)
 
             if went_oos:
                 lines = ["<b>🔴 OTAKUME — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+                log_events("otakume", "oos", went_oos)
 
             if not (new_products or restocked or went_oos):
                 log.info("Otakume: no changes")
@@ -793,6 +895,7 @@ async def check_virgin_megastore(
             raise RuntimeError("no products parsed")
 
         log.info("%s: %d unique products across %d URL(s)", log_name, len(current), len(urls))
+        mark_ok(state, state_key)
 
         prev      = state.get(state_key, {})
         first_run = len(prev) == 0
@@ -824,16 +927,19 @@ async def check_virgin_megastore(
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events(state_key, "new", new_products)
             if restocked:
                 lines = [f"<b>🟢 {headline} — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+                log_events(state_key, "restock", restocked)
             if went_oos:
                 lines = [f"<b>🔴 {headline} — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+                log_events(state_key, "oos", went_oos)
             if not (new_products or restocked or went_oos):
                 log.info("%s: no changes", log_name)
 
@@ -996,11 +1102,15 @@ async def check_legends_own_the_game(state: dict, client: httpx.AsyncClient) -> 
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
         if not current:
-            log.warning("Legends Own The Game: no Pokemon products returned by API")
-            state["legends_own_the_game"] = current
+            # Do NOT wipe the baseline: a transient empty 200 (Ecwid hiccup /
+            # rate limit) previously reset state, so the next good pass
+            # re-baselined ~100 products as a spam wall that buried real alerts.
+            log.warning("Legends Own The Game: no Pokemon products returned by API — keeping previous state")
             return state
 
         log.info("Legends Own The Game: %d products found", len(current))
+
+        mark_ok(state, "legends_own_the_game")
 
         prev      = state.get("legends_own_the_game", {})
         first_run = len(prev) == 0
@@ -1162,6 +1272,8 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
 
         log.info("Colorland Toys: %d products found across %d page(s)", len(current), page_num)
 
+        mark_ok(state, "colorland_toys")
+
         prev      = state.get("colorland_toys", {})
         first_run = len(prev) == 0
 
@@ -1205,16 +1317,19 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("colorland_toys", "new", new_products)
             if restocked:
                 lines = ["<b>🟢 COLORLAND TOYS — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+                log_events("colorland_toys", "restock", restocked)
             if went_oos:
                 lines = ["<b>🔴 COLORLAND TOYS — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+                log_events("colorland_toys", "oos", went_oos)
             if not (new_products or restocked or went_oos):
                 log.info("Colorland Toys: no changes")
 
@@ -1318,6 +1433,8 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
 
         log.info("Toy Corner: %d products found across %d page(s)", len(current), page_num)
 
+        mark_ok(state, "toycorner")
+
         prev      = state.get("toycorner", {})
         first_run = len(prev) == 0
 
@@ -1350,16 +1467,19 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("toycorner", "new", new_products)
             if restocked:
                 lines = ["<b>🟢 TOY CORNER — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+                log_events("toycorner", "restock", restocked)
             if went_oos:
                 lines = ["<b>🔴 TOY CORNER — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+                log_events("toycorner", "oos", went_oos)
             if not (new_products or restocked or went_oos):
                 log.info("Toy Corner: no changes")
 
@@ -1470,6 +1590,8 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
             return state
 
         log.info("Kinokuniya: %d unique product(s) across %d search term(s)", len(current), len(search_urls))
+
+        mark_ok(state, "kinokuniya")
 
         prev      = state.get("kinokuniya", {})
         first_run = len(prev) == 0
@@ -1583,6 +1705,8 @@ async def check_kinokuniya_event(state: dict, client: httpx.AsyncClient) -> dict
             return state
 
         log.info("Kinokuniya event '%s': %d product(s)", event_name, len(current))
+
+        mark_ok(state, "kinokuniya_event")
 
         prev      = state.get("kinokuniya_event", {})
         first_run = len(prev) == 0
@@ -2086,6 +2210,8 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
 
         log.info("ELC Toys: %d Pokemon TCG product(s)", len(current))
 
+        mark_ok(state, "elctoys")
+
         prev      = state.get("elctoys", {})
         first_run = len(prev) == 0
 
@@ -2121,16 +2247,19 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in new_products:
                     lines.append(fmt_product(p) + _cart_line(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("elctoys", "new", new_products)
             if restocked:
                 lines = ["<b>🟢 ELC TOYS — Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅") + _cart_line(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("elctoys", "restock", restocked)
             if went_oos:
                 lines = ["<b>🔴 ELC TOYS — Out of Stock</b>"]
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+                log_events("elctoys", "oos", went_oos)
             if not (new_products or restocked or went_oos):
                 log.info("ELC Toys: no changes")
 
@@ -2196,9 +2325,12 @@ async def check_magrudy(state: dict, client: httpx.AsyncClient) -> dict:
             key = product_key(title)
             current[key] = {"title": title, "url": prod_url, "price": price, "available": True}
 
+        if current:
+            mark_ok(state, "magrudy")
         if not current:
-            log.warning("Magrudy: no products returned by API")
-            state["magrudy"] = current
+            # Same as Legends: never wipe the baseline on a transient empty
+            # response, or the next clean pass re-alerts the whole catalogue.
+            log.warning("Magrudy: no products returned by API — keeping previous state")
             return state
 
         prev      = state.get("magrudy", {})
@@ -2292,6 +2424,8 @@ async def check_zgames(state: dict, client: httpx.AsyncClient, context: BrowserC
             return state
 
         log.info("ZGames: %d products found", len(current))
+
+        mark_ok(state, "zgames")
 
         prev      = state.get("zgames", {})
         first_run = len(prev) == 0
@@ -2570,6 +2704,7 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
             return state
 
         log.info("Little Things: %d products found", len(current))
+        mark_ok(state, "little_things")
 
         prev = state.get("little_things", {})
         first_run = len(prev) == 0
@@ -2623,6 +2758,7 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("little_things", "new", new_products)
             if restocked:
                 lines = [f"<b>🔥 LITTLE THINGS — {len(restocked)} Back In Stock!</b>"]
                 for p in restocked:
@@ -2719,6 +2855,7 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
             return state
 
         log.info("Little Things OP: %d products found", len(current))
+        mark_ok(state, "little_things_onepiece")
 
         prev = state.get("little_things_onepiece", {})
         first_run = len(prev) == 0
@@ -2750,6 +2887,7 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
                 for p in new_products:
                     lines.append(fmt_product(p))
                 await send_telegram("\n".join(lines), client)
+                log_events("little_things_onepiece", "new", new_products)
             if restocked:
                 lines = [f"<b>🔥 LITTLE THINGS (One Piece) — {len(restocked)} Back In Stock!</b>"]
                 for p in restocked:
@@ -2821,24 +2959,29 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     """The core monitoring loop — runs until cancelled."""
     state = load_state()
 
-    # Always re-send every site's full product list on every start
-    state["otakume"]              = {}
-    state["virgin_megastore"]     = {}
-    state["virgin_megastore_onepiece"] = {}
-    state["legends_own_the_game"] = {}
-    # Don't wipe colorland — pagination causes products to flicker in/out
-    # state["colorland_toys"]     = {}
-    state["_colorland_startup_sent"] = False
-    state["magrudy"]              = {}
-    state["zgames"]               = {}
-    state["geekay"]               = {}
-    state["little_things"]        = {}
-    state["little_things_onepiece"] = {}
-    # Don't wipe toycorner — pagination causes products to flicker in/out
-    state["_toycorner_startup_sent"] = False
-    state["kinokuniya"]            = {}
-    state["kinokuniya_event"]      = {}
-    state["elctoys"]               = {}
+    # QUIET RESTARTS (was: wipe every site's state so all baselines re-send).
+    # Wiping meant a redeploy near drop time buried the one alert that mattered
+    # under a dozen baseline walls, AND folded anything that changed while we
+    # were down silently into the new baseline. State now persists on the
+    # volume, so a restart resumes diffing where it left off.
+    # Set REBASELINE=true to force the old full-resend behaviour once.
+    if os.environ.get("REBASELINE", "").lower() == "true":
+        log.warning("REBASELINE=true — wiping all retailer state, full baselines will re-send")
+        for k in ("otakume", "virgin_megastore", "virgin_megastore_onepiece",
+                  "legends_own_the_game", "colorland_toys", "magrudy", "zgames",
+                  "geekay", "little_things", "little_things_onepiece", "toycorner",
+                  "kinokuniya", "kinokuniya_event", "elctoys"):
+            state[k] = {}
+        state["_colorland_startup_sent"] = False
+        state["_toycorner_startup_sent"] = False
+    else:
+        kept = {k: len(v) for k, v in state.items()
+                if isinstance(v, dict) and v and not k.startswith("_")}
+        log.info("Quiet restart — resuming with existing state: %s", kept or "(empty, will baseline)")
+        # These two already gate their own startup summary on a session flag;
+        # leave the flags set so a restart doesn't re-send their summaries.
+        state.setdefault("_colorland_startup_sent", bool(state.get("colorland_toys")))
+        state.setdefault("_toycorner_startup_sent", bool(state.get("toycorner")))
 
     # ── Status board ──────────────────────────────────────────────────────────
     # One Telegram message that gets edited after each check
@@ -3078,9 +3221,20 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                         if site_name.endswith("_lorcana"):
                             ok = bool(state.get(f"_{site_name}_started"))
                         else:
-                            ok = bool(state.get(site_name))
+                            # Honest health: did this site actually complete a
+                            # check recently? A blind site (dead filter, 403,
+                            # empty parse) stops refreshing its _last_ok stamp
+                            # and correctly flips to ❌ instead of showing a
+                            # stale ✅ forever.
+                            ok = not check_is_stale(
+                                state, site_name,
+                                INTERVALS.get(site_name, 120),
+                            )
                         _mark(site_name, ok)
-                        _track_success(site_name)
+                        if ok:
+                            _track_success(site_name)
+                        else:
+                            await _track_failure(site_name, "check completed but returned no usable data (site may be blind)")
                 save_state(state)
                 await _push_status()
 
@@ -3120,18 +3274,41 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
       stop  — pause monitoring
       status — report current state
     """
-    monitor_task:  asyncio.Task | None = None
+    # holder["task"] is the live monitor task. The watchdog mutates this when it
+    # self-heals, so both sides always see the current task.
+    holder: dict = {"task": None}
     watchdog_task: asyncio.Task | None = None
+
+    def _spawn_monitor() -> asyncio.Task:
+        return asyncio.create_task(monitor_loop(client, browser, headless_browser, pw))
 
     # Skip any messages that arrived before the script started
     updates = await poll_telegram(0, client)
     offset  = (updates[-1]["update_id"] + 1) if updates else 0
     log.info("Telegram listener ready (skipped %d old message(s))", len(updates))
 
-    await send_telegram(
-        "🤖 <b>UAE Pokemon TCG Monitor is online.</b>\n\nSend <code>start</code> to begin monitoring.",
-        client,
-    )
+    # AUTO-START (default on). Previously a Railway redeploy / OOM-kill / host
+    # migration left the monitor dead until a human noticed one Telegram message
+    # and replied "start" — the single biggest blind window in the system.
+    # Set AUTO_START=false to go back to manual start.
+    auto_start = os.environ.get("AUTO_START", "true").lower() != "false"
+
+    if auto_start:
+        HEARTBEAT["last"] = 0.0
+        holder["task"] = _spawn_monitor()
+        watchdog_task  = asyncio.create_task(run_watchdog(holder, client, _spawn_monitor))
+        log.info("Auto-started monitoring on boot")
+        await send_telegram(
+            "🤖 <b>UAE Pokemon TCG Monitor is online.</b>\n\n"
+            "▶️ Monitoring <b>auto-started</b>.\n"
+            "Send <code>stop</code> to pause, <code>status</code> for a snapshot.",
+            client,
+        )
+    else:
+        await send_telegram(
+            "🤖 <b>UAE Pokemon TCG Monitor is online.</b>\n\nSend <code>start</code> to begin monitoring.",
+            client,
+        )
 
     while True:
         updates = await poll_telegram(offset, client)
@@ -3150,12 +3327,12 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
             log.info("Telegram command received: %r", text)
 
             if text == "start":
-                if monitor_task and not monitor_task.done():
+                if holder["task"] and not holder["task"].done():
                     await send_telegram("⚠️ Monitor is already running.", client)
                 else:
                     HEARTBEAT["last"] = 0.0   # reset before new run
-                    monitor_task  = asyncio.create_task(monitor_loop(client, browser, headless_browser, pw))
-                    watchdog_task = asyncio.create_task(run_watchdog(monitor_task, client))
+                    holder["task"] = _spawn_monitor()
+                    watchdog_task  = asyncio.create_task(run_watchdog(holder, client, _spawn_monitor))
                     await send_telegram(
                         "✅ <b>UAE Retailer Monitor started!</b>\n\n"
                         f"🟡 Otakume: every {INTERVALS['otakume'] // 60} min\n"
@@ -3178,10 +3355,10 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                     log.info("Monitor started via Telegram")
 
             elif text == "stop":
-                if not monitor_task or monitor_task.done():
+                if not holder["task"] or holder["task"].done():
                     await send_telegram("⚠️ Monitor is not running.", client)
                 else:
-                    monitor_task.cancel()
+                    holder["task"].cancel()
                     if watchdog_task and not watchdog_task.done():
                         watchdog_task.cancel()
                     await asyncio.sleep(1)
@@ -3189,7 +3366,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                     log.info("Monitor stopped via Telegram")
 
             elif text == "status":
-                running = monitor_task and not monitor_task.done()
+                running = holder["task"] and not holder["task"].done()
                 icon    = "🟢 Running" if running else "🔴 Stopped"
                 await send_telegram(f"<b>Status:</b> {icon}", client)
 
