@@ -305,6 +305,31 @@ def log_events(site: str, kind: str, products: list) -> None:
 # timestamp (exactly how Otakume's dead filter went unnoticed for hours).
 # Checkers now stamp a success time; "healthy" means *succeeded recently*.
 
+# Display names + Shopify cart hosts, shared by the status/stock commands.
+RETAILER_LABELS = {
+    "little_things":             "🛍️ Little Things",
+    "little_things_onepiece":    "🏴\u200d☠️ Little Things (OP)",
+    "elctoys":                   "🧸 ELC Toys",
+    "colorland_toys":            "🧩 Colorland Toys",
+    "toycorner":                 "🧸 Toy Corner",
+    "otakume":                   "🟡 Otakume",
+    "virgin_megastore":          "🇦🇪 Virgin Megastore",
+    "virgin_megastore_onepiece": "🏴\u200d☠️ Virgin (OP)",
+    "legends_own_the_game":      "🎴 Legends",
+    "magrudy":                   "📚 Magrudy",
+    "kinokuniya":                "📚 Kinokuniya",
+    "kinokuniya_event":          "🎴 Kinokuniya Event",
+    "zgames":                    "🕹️ ZGames",
+}
+
+# Stores where a /cart/{variant_id}:1 permalink works (Shopify).
+CART_HOSTS = {
+    "little_things":          "littlethingsme.com",
+    "little_things_onepiece": "littlethingsme.com",
+    "elctoys":                "elctoys.com",
+}
+
+
 def mark_ok(state: dict, site: str) -> None:
     """Called by a checker only when it actually completed and parsed products."""
     state.setdefault("_last_ok", {})[site] = time.time()
@@ -3500,14 +3525,63 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
             elif text == "status":
                 running = holder["task"] and not holder["task"].done()
                 icon    = "🟢 Running" if running else "🔴 Stopped"
-                await send_telegram(f"<b>Status:</b> {icon}", client)
+                snap    = load_state()
+                lines   = [f"<b>Status:</b> {icon}", ""]
+                last_ok = snap.get("_last_ok") or {}
+                now_ts  = time.time()
+                for key, label in RETAILER_LABELS.items():
+                    tracked = snap.get(key)
+                    if tracked is None:
+                        continue
+                    stamp = last_ok.get(key)
+                    if stamp is None:
+                        mark = "⏳"
+                        age  = "no check yet"
+                    else:
+                        stale = (now_ts - stamp) > max(3 * INTERVALS.get(key, 120), 300)
+                        mark  = "❌" if stale else "✅"
+                        age   = f"{int((now_ts - stamp) // 60)}m ago"
+                    n_in = sum(1 for v in (tracked or {}).values()
+                               if isinstance(v, dict) and v.get("available"))
+                    lines.append(f"{mark} {label} — {n_in} in stock <i>({age})</i>")
+                lines.append("\nSend <code>stock</code> for the full in-stock list.")
+                await send_telegram("\n".join(lines), client)
+
+            elif text in ("stock", "instock", "in stock"):
+                # On-demand snapshot. Baselines no longer auto-resend on restart
+                # (they buried real alerts), so this is how you ask "what's in
+                # stock right now". Reads persisted state — no refetching.
+                snap  = load_state()
+                lines = ["<b>📦 CURRENTLY IN STOCK</b>"]
+                total = 0
+                for key, label in RETAILER_LABELS.items():
+                    items = [v for v in (snap.get(key) or {}).values()
+                             if isinstance(v, dict) and v.get("available")]
+                    if not items:
+                        continue
+                    total += len(items)
+                    lines.append(f"\n<b>{label}</b> ({len(items)})")
+                    for p in items[:15]:
+                        lines.append(fmt_product(p))
+                        vid = p.get("variant_id")
+                        cart = CART_HOSTS.get(key)
+                        if vid and cart:
+                            lines.append(f'  <a href="https://{cart}/cart/{vid}:1">🛒 Tap to checkout</a>')
+                    if len(items) > 15:
+                        lines.append(f"  ...and {len(items) - 15} more")
+                if not total:
+                    lines.append("\nNothing in stock right now.")
+                else:
+                    lines.insert(1, f"<i>{total} product(s) across all retailers</i>")
+                await send_telegram("\n".join(lines), client)
 
             else:
                 await send_telegram(
                     "Commands:\n"
                     "  <code>start</code>  — begin monitoring\n"
                     "  <code>stop</code>   — pause monitoring\n"
-                    "  <code>status</code> — check if running",
+                    "  <code>status</code> — health of every retailer\n"
+                    "  <code>stock</code>  — everything in stock right now",
                     client,
                 )
 
