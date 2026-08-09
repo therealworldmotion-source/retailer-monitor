@@ -1620,6 +1620,138 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+# Pinned Kinokuniya event page(s). 1243 (Pitch Black) stays pinned even after it
+# drains, so a restock on it is still caught. Override/extend via env:
+#   KINOKUNIYA_EVENT_URLS="https://uae.kinokuniya.com/events/1243,https://.../events/1300"
+KINOKUNIYA_EVENT_URLS = [
+    u.strip() for u in os.environ.get(
+        "KINOKUNIYA_EVENT_URLS",
+        "https://uae.kinokuniya.com/events/1243",
+    ).split(",") if u.strip()
+]
+
+# How often to rescan the /events index for brand-new Pokemon event pages.
+KINO_DISCOVERY_INTERVAL = int(os.environ.get("KINOKUNIYA_DISCOVERY_INTERVAL", "1800"))
+
+
+def _parse_kino_event(soup, current: dict, event_name: str) -> None:
+    """Extract products from one Kinokuniya event page into `current`.
+    Products are <a href='/bw/{barcode}'> links (image + text variants) with an
+    adjacent AED price; merged by barcode."""
+    for a in soup.select("a[href*='/bw/']"):
+        href = a.get("href", "")
+        m = re.search(r"/bw/(\d+)", href)
+        if not m:
+            continue
+        barcode = m.group(1)
+
+        txt = a.get_text(" ", strip=True)
+        img = a.select_one("img")
+        title = txt or (img.get("alt", "") if img else "")
+        if title and title_excluded(title):
+            continue
+
+        price = "N/A"
+        node = a
+        for _ in range(4):
+            node = node.parent
+            if not node:
+                break
+            pm = re.search(r"AED\s*[\d.,]+", node.get_text(" ", strip=True))
+            if pm:
+                price = pm.group(0)
+                break
+
+        prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
+        existing = current.get(barcode)
+        if existing and not title:
+            continue
+        current[barcode] = {
+            "title":     title or (existing or {}).get("title", "") or f"Product {barcode}",
+            "url":       prod_url,
+            "price":     price if price != "N/A" else (existing or {}).get("price", "N/A"),
+            "available": True,
+            "event":     event_name,
+        }
+
+
+async def discover_kinokuniya_events(state: dict, client: httpx.AsyncClient) -> dict:
+    """Scan /events for NEW Pokemon-themed event pages.
+
+    The index only lists currently-promoted events and its labels are image
+    alt-text, so each unseen event id must be opened to read its real title
+    (h2.eventDetTitle). Classified ids are cached in state so each event is
+    only ever fetched once. Finding a new Pokemon event is itself an early
+    drop signal, so it alerts."""
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        return state
+
+    try:
+        seen  = set(state.get("_kino_seen_events") or [])
+        found = list(state.get("_kino_discovered_events") or [])
+        newly = []
+
+        async with AsyncSession(impersonate="safari17_0") as cf:
+            try:
+                await cf.get("https://uae.kinokuniya.com/", timeout=15)
+            except Exception:
+                pass
+
+            idx = await cf.get(
+                "https://uae.kinokuniya.com/events",
+                headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
+                timeout=25,
+            )
+            if idx.status_code != 200:
+                log.warning("Kinokuniya discovery: index HTTP %s", idx.status_code)
+                return state
+
+            ids = sorted(set(re.findall(r"/events/(\d+)", idx.text)), key=int, reverse=True)
+            unseen = [i for i in ids if i not in seen][:12]  # cap work per pass
+            log.info("Kinokuniya discovery: %d event(s) on index, %d unclassified", len(ids), len(unseen))
+
+            for eid in unseen:
+                url = f"https://uae.kinokuniya.com/events/{eid}"
+                try:
+                    r = await cf.get(
+                        url,
+                        headers={"Referer": "https://uae.kinokuniya.com/events", "Accept-Language": "en-US,en;q=0.9"},
+                        timeout=25,
+                    )
+                    if r.status_code != 200:
+                        continue
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    t_el = soup.select_one("h2.eventDetTitle")
+                    title = t_el.get_text(strip=True) if t_el else ""
+                    body  = strip_accents(title + " " + (soup.get_text(" ", strip=True)[:4000]))
+                    seen.add(eid)
+                    if "pokemon" in strip_accents(title) or "pokemon tcg" in body:
+                        if url not in found:
+                            found.append(url)
+                            newly.append((eid, title or "(untitled)"))
+                            log.info("Kinokuniya discovery: NEW Pokemon event /events/%s — %r", eid, title)
+                except Exception as exc:
+                    log.debug("Kinokuniya discovery: %s failed: %s", eid, exc)
+                await asyncio.sleep(random.uniform(0.8, 1.6))
+
+        state["_kino_seen_events"]       = sorted(seen, key=lambda x: int(x))
+        state["_kino_discovered_events"] = found
+
+        if newly:
+            lines = ["<b>🆕 KINOKUNIYA — New Pokémon event page(s) found!</b>",
+                     "<i>A new drop page just went up — products may follow.</i>", ""]
+            for eid, title in newly:
+                lines.append(f'  🎴 <a href="https://uae.kinokuniya.com/events/{eid}">{title}</a>')
+            await send_telegram("\n".join(lines), client)
+
+    except Exception as exc:
+        log.error("Kinokuniya discovery failed: %s", exc)
+
+    return state
+
+
 async def check_kinokuniya_event(state: dict, client: httpx.AsyncClient) -> dict:
     """Kinokuniya UAE — curated Pokémon drop/event page (e.g. /events/1243).
 
@@ -1642,66 +1774,55 @@ async def check_kinokuniya_event(state: dict, client: httpx.AsyncClient) -> dict
     try:
         await asyncio.sleep(random.uniform(1, 3))
 
+        # Pinned event URL(s) + any Pokemon events auto-discovered from /events.
+        # The pinned 1243 stays even after it drains, so a restock there is still
+        # caught; discovery picks up the NEXT drop's brand-new event id.
+        event_urls = list(KINOKUNIYA_EVENT_URLS)
+        for u in (state.get("_kino_discovered_events") or []):
+            if u not in event_urls:
+                event_urls.append(u)
+
+        event_name = "Kinokuniya Event"
+        any_ok = False
+
         async with AsyncSession(impersonate="safari17_0") as cf:
             try:
                 await cf.get("https://uae.kinokuniya.com/", timeout=15)
             except Exception:
                 pass
-            resp = await cf.get(
-                URLS["kinokuniya_event"],
-                headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
-                timeout=25,
-            )
 
-        if resp.status_code != 200:
-            log.warning("Kinokuniya event: HTTP %s", resp.status_code)
+            for ev_url in event_urls:
+                resp = await cf.get(
+                    ev_url,
+                    headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=25,
+                )
+                if resp.status_code != 200:
+                    log.warning("Kinokuniya event: HTTP %s for %s", resp.status_code, ev_url)
+                    continue
+                any_ok = True
+                soup = BeautifulSoup(resp.text, "html.parser")
+                t_el = soup.select_one("h2.eventDetTitle") or soup.select_one("title")
+                this_name = t_el.get_text(strip=True) if t_el else "Kinokuniya Event"
+                event_name = this_name
+                before = len(current)
+                _parse_kino_event(soup, current, this_name)
+                log.info("Kinokuniya event %s (%r): +%d product(s)",
+                         ev_url.rsplit("/", 1)[-1], this_name[:40], len(current) - before)
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        if not any_ok:
+            log.warning("Kinokuniya event: no event page fetched successfully")
             return state
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title_el = soup.select_one("h2.eventDetTitle") or soup.select_one("title")
-        event_name = title_el.get_text(strip=True) if title_el else "Kinokuniya Event"
-
-        # Each product appears as one or more /bw/{barcode} links; the text
-        # link carries the title, and an AED price sits nearby. Merge by barcode.
-        for a in soup.select("a[href*='/bw/']"):
-            href = a.get("href", "")
-            m = re.search(r"/bw/(\d+)", href)
-            if not m:
-                continue
-            barcode = m.group(1)
-
-            txt = a.get_text(" ", strip=True)
-            img = a.select_one("img")
-            title = txt or (img.get("alt", "") if img else "")
-            if title and title_excluded(title):
-                continue
-
-            # Price: search this link's ancestors for an AED amount
-            price = "N/A"
-            node = a
-            for _ in range(4):
-                node = node.parent
-                if not node:
-                    break
-                pm = re.search(r"AED\s*[\d.,]+", node.get_text(" ", strip=True))
-                if pm:
-                    price = pm.group(0)
-                    break
-
-            prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
-            existing = current.get(barcode)
-            # Prefer the entry that has a real title over an image-only link
-            if existing and not title:
-                continue
-            current[barcode] = {
-                "title":     title or (existing or {}).get("title", "") or f"Product {barcode}",
-                "url":       prod_url,
-                "price":     price if price != "N/A" else (existing or {}).get("price", "N/A"),
-                "available": True,
-            }
-
+        # An event page that fetched fine but lists nothing is a VALID state —
+        # the pinned Pitch Black event has sold through. Treat it as healthy
+        # (so it doesn't fire a false FAILING alert) and keep state empty, so
+        # that when a drop does land the products alert as new.
         if not current:
-            log.warning("Kinokuniya event: no products parsed — page layout may have changed")
+            log.info("Kinokuniya event: fetched OK, 0 products listed (event drained / not yet live)")
+            mark_ok(state, "kinokuniya_event")
+            state["kinokuniya_event"] = {}
             return state
 
         log.info("Kinokuniya event '%s': %d product(s)", event_name, len(current))
@@ -3065,7 +3186,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -3184,6 +3305,17 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kinokuniya_event >= INTERVALS.get("kinokuniya_event", 120):
                 headless_tasks.append(("kinokuniya_event", check_kinokuniya_event(state, client)))
                 last_kinokuniya_event = now
+
+            # Auto-discovery of brand-new Pokemon event pages runs on a much
+            # slower timer (it opens each unclassified event once to read its
+            # real title). Runs inline so it can't race the event checker.
+            if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kino_discovery >= KINO_DISCOVERY_INTERVAL:
+                last_kino_discovery = now
+                try:
+                    state = await discover_kinokuniya_events(state, client)
+                    save_state(state)
+                except Exception as exc:
+                    log.error("Kinokuniya discovery error: %s", exc)
 
             if "elctoys" not in DISABLED_RETAILERS and now - last_elctoys >= INTERVALS.get("elctoys", 120):
                 headless_tasks.append(("elctoys", check_elctoys(state, client)))
