@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 300, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -1390,6 +1390,11 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
 
     Tracked by ASIN. Alerts on new listings appearing and on out-of-stock ->
     in-stock transitions."""
+    until = float(state.get("_amazon_backoff_until", 0) or 0)
+    if until and time.time() < until:
+        log.info("Amazon.ae: in backoff for another %d min — skipping", int((until - time.time()) // 60) + 1)
+        return state
+
     log.info("Checking Amazon.ae...")
     try:
         from curl_cffi.requests import AsyncSession
@@ -1488,13 +1493,27 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                 await asyncio.sleep(random.uniform(8, 14))
 
         if not any_ok:
-            log.warning("Amazon.ae: no page fetched successfully — skipping state update")
+            # Amazon blocks datacenter IPs outright (observed: 100% 503 from
+            # Railway while the same requests succeed from residential). Keep
+            # hammering and the block persists, so back off progressively:
+            # 10m -> 20m -> 40m -> 80m, capped at 4h, reset on first success.
+            fails = int(state.get("_amazon_fail_streak", 0)) + 1
+            state["_amazon_fail_streak"] = fails
+            base = INTERVALS.get("amazon_ae", 600)
+            backoff = min(base * (2 ** min(fails - 1, 5)), 14400)
+            state["_amazon_backoff_until"] = time.time() + backoff
+            log.warning("Amazon.ae: no page fetched (fail streak %d) — backing off %d min "
+                        "(datacenter IP likely blocked)", fails, backoff // 60)
             return state
         if not current:
             log.warning("Amazon.ae: 0 relevant products parsed — filters or layout may have changed")
             return state
 
         log.info("Amazon.ae: %d relevant product(s)%s", len(current), " [PARTIAL]" if partial else "")
+        if state.get("_amazon_fail_streak"):
+            log.info("Amazon.ae: recovered after %s failed pass(es)", state["_amazon_fail_streak"])
+        state["_amazon_fail_streak"] = 0
+        state.pop("_amazon_backoff_until", None)
         mark_ok(state, "amazon_ae")
 
         prev = state.get("amazon_ae") or {}
@@ -3989,7 +4008,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("littlethings_backend", check_littlethings_backend(state, client)))
                 last_lt_backend = now
 
-            if "amazon_ae" not in DISABLED_RETAILERS and now - last_amazon >= INTERVALS.get("amazon_ae", 300):
+            if "amazon_ae" not in DISABLED_RETAILERS and now - last_amazon >= INTERVALS.get("amazon_ae", 600):
                 headless_tasks.append(("amazon_ae", check_amazon_ae(state, client)))
                 last_amazon = now
 
