@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -105,6 +105,8 @@ def _config_from_env() -> dict | None:
             # Hybris product sitemap — a product is written here when it is CREATED,
             # usually before it is searchable/purchasable. Earliest possible signal.
             "virgin_sitemap": "https://www.virginmegastore.ae/sitemap/PRODUCT-en-AED.xml",
+            "littlethings_sitemap_index": "https://littlethingsme.com/sitemap.xml",
+            "littlethings_collections": "https://littlethingsme.com/collections.json?limit=250",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
@@ -258,6 +260,7 @@ def load_state() -> dict:
         "kinokuniya_event":     {},
         "elctoys":              {},
         "virgin_sitemap":       {},
+        "littlethings_backend": {},
     }
 
 
@@ -315,6 +318,7 @@ RETAILER_LABELS = {
     "little_things_onepiece":    "🏴\u200d☠️ Little Things (OP)",
     "elctoys":                   "🧸 ELC Toys",
     "virgin_sitemap":            "🗺️ Virgin Sitemap Watch",
+    "littlethings_backend":      "🗺️ Little Things Backend",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -332,6 +336,7 @@ CART_HOSTS = {
     "little_things":          "littlethingsme.com",
     "little_things_onepiece": "littlethingsme.com",
     "elctoys":                "elctoys.com",
+    "littlethings_backend":   "littlethingsme.com",
 }
 
 
@@ -1118,6 +1123,211 @@ async def check_virgin_sitemap(state: dict, client: httpx.AsyncClient) -> dict:
     except Exception as exc:
         log.error("Virgin sitemap check failed: %s", exc)
 
+    return state
+
+
+# ─── LITTLE THINGS — BACKEND WATCH (whole store + staging collections) ────────
+#
+# The 30s collection checker only sees /collections/pokemon-tcg. This watches
+# the rest of the Shopify backend for the earliest public signals:
+#   1. collections.json — a NEW Pokemon/TCG/anniversary collection being created,
+#      or a staging collection (pokemon-tcg-preorder, new-set-of-pokemon, ...)
+#      going 0 -> N products. Both usually precede a drop.
+#   2. product sitemap — Shopify splits it into files by ascending product-ID
+#      range, so brand-new products always land in the LAST file(s). Diffing
+#      just those (2 requests, not 27) catches a new product ANYWHERE in the
+#      store — e.g. a 30th anniversary item filed under toys, not the TCG
+#      collection. New hits are enriched via /products/{handle}.js for title,
+#      price, availability and a cart permalink.
+#   3. suggest.json for '30th anniversary' as a cheap cross-check.
+# ~6 requests per pass. Terms: LT_BACKEND_TERMS (default pokemon,pikachu,
+# 30th anniversary). pokemon/pikachu hits must also look like TCG — Little
+# Things carries ~1,000 Pokemon plush/figures that would otherwise flood.
+
+LT_BACKEND_TERMS = [t.strip().lower() for t in os.environ.get(
+    "LT_BACKEND_TERMS", "pokemon,pikachu,30th anniversary").split(",") if t.strip()]
+LT_TCG_HINTS = ("tcg", "booster", "elite trainer", "etb", "blister", "deck",
+                "tin", "collection box", "premium collection", "trading card", "gift box", "card")
+LT_STAGING_COLLECTIONS = ("pokemon-tcg-preorder", "new-set-of-pokemon", "pokemon-tcg-special-bundle",
+                          "new-pokemon-tcg", "pokemon-highlight", "tcg-discount")
+LT_COLLECTION_TERMS = ("pokemon", "pikachu", "tcg", "anniversar", "30th", "trading card")
+
+
+def _lt_backend_term(slug: str) -> str | None:
+    hay = strip_accents(re.sub(r"[-_/]+", " ", slug))
+    for t in LT_BACKEND_TERMS:
+        if t in hay:
+            if t in ("pokemon", "pikachu") and not any(h in hay for h in LT_TCG_HINTS):
+                continue
+            return t
+    return None
+
+
+async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> dict:
+    log.info("Checking Little Things backend (collections + sitemap tail)...")
+    hdr = get_json_headers()
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+
+        # ── 1. collections.json ──────────────────────────────────────────
+        cols: dict[str, dict] = {}
+        page = 1
+        while page <= 5:
+            r = await client.get(f"{URLS['littlethings_collections']}&page={page}", headers=hdr, timeout=25)
+            if r.status_code != 200:
+                log.warning("LT backend: collections HTTP %s on page %d — skipping pass", r.status_code, page)
+                return state
+            batch = json.loads(r.content).get("collections", [])
+            for c in batch:
+                h = c.get("handle", "")
+                if h:
+                    cols[h] = {"title": c.get("title", ""), "count": int(c.get("products_count") or 0)}
+            if len(batch) < 250:
+                break
+            page += 1
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+
+        # ── 2. product sitemap tail ──────────────────────────────────────
+        r = await client.get(URLS["littlethings_sitemap_index"], headers=get_headers("https://littlethingsme.com/"), timeout=30)
+        if r.status_code != 200:
+            log.warning("LT backend: sitemap index HTTP %s — skipping pass", r.status_code)
+            return state
+        files = [u.replace("&amp;", "&") for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text)
+                 if "sitemap_products_" in u and "/en-" not in u]
+        def _num(u):
+            m = re.search(r"sitemap_products_(\d+)", u)
+            return int(m.group(1)) if m else 0
+        files.sort(key=_num)
+        tail = files[-2:] if len(files) >= 2 else files
+        if not tail:
+            log.warning("LT backend: no product sitemaps in index — skipping pass")
+            return state
+
+        handles: dict[str, str] = {}   # handle -> product url
+        for f in tail:
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+            rr = await client.get(f, headers=get_headers("https://littlethingsme.com/"), timeout=60)
+            if rr.status_code != 200:
+                log.warning("LT backend: sitemap %s HTTP %s — skipping pass", f[-40:], rr.status_code)
+                return state
+            urls = [u for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", rr.text) if "/products/" in u]
+            if len(urls) < 50:
+                log.warning("LT backend: sitemap %s parsed only %d URLs — treating as failed", f[-40:], len(urls))
+                return state
+            for u in urls:
+                h = u.rsplit("/products/", 1)[-1].split("?")[0].strip("/")
+                if h:
+                    handles[h] = u
+        log.info("LT backend: %d collections, %d product URLs in sitemap tail (%s)",
+                 len(cols), len(handles), ", ".join(f"#{_num(f)}" for f in tail))
+
+        matched = {h: u for h, u in handles.items() if _lt_backend_term(h)}
+
+        # ── 3. suggest.json cross-check for anniversary items ───────────
+        try:
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            rs = await client.get("https://littlethingsme.com/search/suggest.json?q=30th+anniversary&resources[type]=product&resources[limit]=10",
+                                  headers=hdr, timeout=20)
+            if rs.status_code == 200:
+                for p in json.loads(rs.content).get("resources", {}).get("results", {}).get("products", []):
+                    h = p.get("handle", "")
+                    if h and _lt_backend_term(h) and h not in matched:
+                        matched[h] = f"https://littlethingsme.com/products/{h}"
+        except Exception as exc:
+            log.debug("LT backend: suggest failed: %s", exc)
+
+        mark_ok(state, "littlethings_backend")
+
+        prev_prod = state.get("littlethings_backend") or {}
+        prev_cols = state.get("_lt_backend_collections") or {}
+        first_run = not prev_prod and not prev_cols
+
+        # ── diff: collections ────────────────────────────────────────────
+        new_cols, staged = [], []
+        if prev_cols:
+            for h, c in cols.items():
+                is_rel = any(t in strip_accents(h + " " + c["title"]) for t in LT_COLLECTION_TERMS)
+                if h not in prev_cols and is_rel:
+                    new_cols.append((h, c))
+                elif h in LT_STAGING_COLLECTIONS and c["count"] > prev_cols.get(h, {}).get("count", 0):
+                    staged.append((h, prev_cols.get(h, {}).get("count", 0), c["count"]))
+
+        # ── diff: products (enrich new hits) ─────────────────────────────
+        new_hits = []
+        if prev_prod:
+            fresh = [h for h in matched if h not in prev_prod][:15]
+            for h in fresh:
+                info = {"title": h.replace("-", " ").title(), "url": matched[h], "price": "N/A",
+                        "available": True, "variant_id": None, "term": _lt_backend_term(h)}
+                try:
+                    await asyncio.sleep(random.uniform(0.6, 1.2))
+                    rj = await client.get(f"https://littlethingsme.com/products/{h}.js", headers=hdr, timeout=20)
+                    if rj.status_code == 200:
+                        pj = json.loads(rj.content)
+                        info["title"] = pj.get("title") or info["title"]
+                        vs = pj.get("variants") or []
+                        info["available"] = any(v.get("available") for v in vs) if vs else bool(pj.get("available"))
+                        av = next((v for v in vs if v.get("available")), vs[0] if vs else {})
+                        info["variant_id"] = av.get("id")
+                        pr = av.get("price")
+                        if pr is not None:
+                            info["price"] = f"AED {int(pr) / 100:.2f}"
+                except Exception as exc:
+                    log.debug("LT backend: enrich %s failed: %s", h, exc)
+                if title_excluded(info["title"]):
+                    continue
+                new_hits.append((h, info))
+
+        # ── state ────────────────────────────────────────────────────────
+        merged = dict(prev_prod)
+        for h, u in matched.items():
+            merged.setdefault(h, {"title": h.replace("-", " ").title(), "url": u, "price": "N/A", "available": True})
+        for h, info in new_hits:
+            merged[h] = {k: info[k] for k in ("title", "url", "price", "available", "variant_id")}
+        state["littlethings_backend"] = merged
+        state["_lt_backend_collections"] = cols
+
+        # ── alerts ───────────────────────────────────────────────────────
+        if first_run:
+            rel = sum(1 for h, c in cols.items() if any(t in strip_accents(h + " " + c["title"]) for t in LT_COLLECTION_TERMS))
+            stg = ", ".join(f"{h}={cols[h]['count']}" for h in LT_STAGING_COLLECTIONS if h in cols)
+            await send_telegram(
+                f"<b>🗺️ LITTLE THINGS BACKEND WATCH — armed</b>\n"
+                f"Baselined {len(matched)} matching products in the sitemap tail, {rel} Pokémon/TCG collections.\n"
+                f"Staging collections: <i>{stg or 'none'}</i>\n"
+                f"<i>Alerts on: new Pokémon/TCG/anniversary collection, staging collection filling, "
+                f"new matching product anywhere in the store.</i>",
+                client,
+            )
+            log.info("LT backend: baseline armed (%d products, %d collections)", len(matched), len(cols))
+            return state
+
+        if new_cols:
+            lines = [f"<b>🗂️🆕 LITTLE THINGS — {len(new_cols)} new Pokémon/TCG collection(s) created!</b>",
+                     "<i>A drop is likely being staged.</i>"]
+            for h, c in new_cols:
+                lines.append(f'  📁 <a href="https://littlethingsme.com/collections/{h}">{c["title"]}</a> ({c["count"]} products)')
+            await send_telegram("\n".join(lines), client)
+        if staged:
+            lines = ["<b>📦👀 LITTLE THINGS — staging collection filling up!</b>"]
+            for h, a, b in staged:
+                lines.append(f'  <a href="https://littlethingsme.com/collections/{h}">{h}</a>: {a} → <b>{b}</b> products')
+            await send_telegram("\n".join(lines), client)
+        if new_hits:
+            lines = [f"<b>🗺️🆕 LITTLE THINGS — {len(new_hits)} NEW product page(s) in the store!</b>"]
+            for h, info in new_hits:
+                icon = "✅" if info["available"] else "👀"
+                line = f'  {icon} <a href="{info["url"]}">{info["title"]}</a> — {info["price"]}  <i>({info["term"]})</i>'
+                if info["available"] and info.get("variant_id"):
+                    line += f'\n     <a href="https://littlethingsme.com/cart/{info["variant_id"]}:1">🛒 Tap to checkout</a>'
+                lines.append(line)
+            await send_telegram("\n".join(lines), client)
+            log_events("littlethings_backend", "new", [i for _, i in new_hits])
+        if not (new_cols or staged or new_hits):
+            log.info("LT backend: no changes")
+
+    except Exception as exc:
+        log.error("Little Things backend check failed: %s", exc)
     return state
 
 
@@ -3279,6 +3489,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
         "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
         "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
+        "littlethings_backend": {"label": "🗺️ Little Things Backend", "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -3286,7 +3497,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -3344,7 +3555,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -3482,6 +3693,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "virgin_sitemap" not in DISABLED_RETAILERS and now - last_virgin_sitemap >= INTERVALS.get("virgin_sitemap", 600):
                 headless_tasks.append(("virgin_sitemap", check_virgin_sitemap(state, client)))
                 last_virgin_sitemap = now
+
+            if "littlethings_backend" not in DISABLED_RETAILERS and now - last_lt_backend >= INTERVALS.get("littlethings_backend", 600):
+                headless_tasks.append(("littlethings_backend", check_littlethings_backend(state, client)))
+                last_lt_backend = now
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
