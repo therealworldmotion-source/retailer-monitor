@@ -2633,44 +2633,64 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                     fetch_error = True
                     break
 
-                soup  = BeautifulSoup(resp.text, "html.parser")
-                items = soup.select("div.product-item[data-json-product]")
-                log.info("ELC Toys: page %d — %d items", page_num, len(items))
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # ELC re-themed in Sept 2026: data-json-product is gone,
+                # replaced by <li.search-page__product><article.product-card>.
+                # Try the new markup first, fall back to the old one.
+                # NB: select only the OUTER container — 'li..., article...' would
+                # match both the li and its nested article and double-count.
+                items = soup.select("li.search-page__product")
+                if not items:
+                    items = soup.select("article.product-card")
+                new_theme = bool(items)
+                if not items:
+                    items = soup.select("div.product-item[data-json-product]")
+                log.info("ELC Toys: page %d — %d items (%s theme)",
+                         page_num, len(items), "new" if new_theme else "legacy")
                 if not items:
                     break
 
                 for item in items:
-                    try:
-                        data = json.loads(item["data-json-product"])
-                    except Exception:
-                        continue
+                    if new_theme:
+                        a = item.select_one("h3.product-card__title a") or item.select_one("a.product-card__media")
+                        href = (a.get("href", "") if a else "").split("?")[0]
+                        handle = href.rsplit("/products/", 1)[-1].strip("/") if "/products/" in href else ""
+                        title = a.get_text(" ", strip=True) if a else ""
+                        if not title:
+                            w = item.select_one("[data-product-title]")
+                            title = w.get("data-product-title", "") if w else ""
+                        amt = item.select_one(".money-display__amount")
+                        price = f"AED {amt.get_text(strip=True)}" if amt else "N/A"
+                        vi = item.select_one("input[name='id']")
+                        variant_id = vi.get("value") if vi else None
+                        blob = item.get_text(" ", strip=True).lower()
+                        available = bool(variant_id) and "sold out" not in blob and "unavailable" not in blob
+                    else:
+                        try:
+                            data = json.loads(item["data-json-product"])
+                        except Exception:
+                            continue
+                        handle = data.get("handle", "")
+                        title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
+                        title = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
+                        variants   = data.get("variants") or [{}]
+                        v          = variants[0]
+                        available  = any(var.get("available") for var in variants)
+                        avail_var  = next((var for var in variants if var.get("available")), v)
+                        variant_id = avail_var.get("id") or v.get("id")
+                        pr = v.get("price", 0)
+                        try:
+                            price = f"AED {int(pr) / 100:.2f}" if pr else "N/A"
+                        except Exception:
+                            price = "N/A"
 
-                    handle = data.get("handle", "")
-                    if not handle:
+                    if not handle or not title or len(title) < 3:
                         continue
-
-                    title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
-                    title    = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
-                    if not title or len(title) < 3:
-                        continue
-
-                    # Pokemon only, and TCG only — ELC is heavy on plushes/figures
                     if not is_pokemon_title(title):
                         continue
                     if not any(h in strip_accents(title) for h in ELC_TCG_HINTS):
                         continue
-
-                    variants   = data.get("variants") or [{}]
-                    v          = variants[0]
-                    available  = any(var.get("available") for var in variants)
-                    avail_var  = next((var for var in variants if var.get("available")), v)
-                    variant_id = avail_var.get("id") or v.get("id")
-
-                    price_raw = v.get("price", 0)
-                    try:
-                        price = f"AED {int(price_raw) / 100:.2f}" if price_raw else "N/A"
-                    except Exception:
-                        price = "N/A"
 
                     current[handle] = {
                         "title": title,
@@ -2680,7 +2700,7 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                         "variant_id": variant_id,
                     }
 
-                if len(items) < 15:
+                if len(items) < (24 if new_theme else 15):
                     break  # last page
                 page_num += 1
                 await asyncio.sleep(random.uniform(2, 4))
