@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -102,6 +102,9 @@ def _config_from_env() -> dict | None:
             "virgin_megastore_search": "https://www.virginmegastore.ae/en/search?text=pokemon+tcg",
             "virgin_megastore_accented": "https://www.virginmegastore.ae/en/search?text=Pok%C3%A9mon+tcg",
             "virgin_megastore_onepiece": "https://www.virginmegastore.ae/en/search?text=one+piece+card+game",
+            # Hybris product sitemap — a product is written here when it is CREATED,
+            # usually before it is searchable/purchasable. Earliest possible signal.
+            "virgin_sitemap": "https://www.virginmegastore.ae/sitemap/PRODUCT-en-AED.xml",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
@@ -254,6 +257,7 @@ def load_state() -> dict:
         "kinokuniya":           {},
         "kinokuniya_event":     {},
         "elctoys":              {},
+        "virgin_sitemap":       {},
     }
 
 
@@ -310,6 +314,7 @@ RETAILER_LABELS = {
     "little_things":             "🛍️ Little Things",
     "little_things_onepiece":    "🏴\u200d☠️ Little Things (OP)",
     "elctoys":                   "🧸 ELC Toys",
+    "virgin_sitemap":            "🗺️ Virgin Sitemap Watch",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -987,6 +992,133 @@ async def check_virgin_megastore_onepiece(state: dict, client: httpx.AsyncClient
         headline="🏴‍☠️ VIRGIN MEGASTORE (OP)",
         keyword_filter="one piece",
     )
+
+
+# ─── VIRGIN MEGASTORE — PRODUCT SITEMAP WATCH (earliest-signal) ───────────────
+
+# URL-slug terms to watch. Slugs are hyphenated, so terms are matched against
+# the slug with hyphens turned into spaces and accents stripped.
+# Override via env: VIRGIN_SITEMAP_TERMS="pokemon,pikachu,30th anniversary"
+VIRGIN_SITEMAP_TERMS = [
+    t.strip().lower() for t in os.environ.get(
+        "VIRGIN_SITEMAP_TERMS", "pokemon,pikachu,30th anniversary"
+    ).split(",") if t.strip()
+]
+
+
+def _slug_title(url: str) -> str:
+    """'/.../razer-kraken---pokemon-espeon-edition/p/1160211' -> 'Razer Kraken - Pokemon Espeon Edition'."""
+    m = re.search(r"/([^/]+)/p/\d+", url)
+    slug = m.group(1) if m else url.rstrip("/").rsplit("/", 1)[-1]
+    words = re.sub(r"-{2,}", " | ", slug).replace("-", " ").replace(" | ", " - ").split()
+    return " ".join(w.upper() if re.fullmatch(r"(tcg|ex|psa|\d+[a-z]?)", w) else (w if w == "-" else w.capitalize()) for w in words)
+
+
+def _sitemap_term(url: str) -> str | None:
+    hay = strip_accents(re.sub(r"[-_/]+", " ", url))
+    for t in VIRGIN_SITEMAP_TERMS:
+        if t in hay:
+            return t
+    return None
+
+
+async def check_virgin_sitemap(state: dict, client: httpx.AsyncClient) -> dict:
+    """Diff Virgin's full product sitemap (~49k URLs) for NEW URLs matching the
+    watch terms. Because Hybris emits a sitemap entry when a product is created
+    in the catalogue — typically before search indexing and before it goes on
+    sale — this fires hours/days ahead of the regular search-based checker.
+
+    First run baselines silently (one summary line, no product wall). After
+    that, only genuinely new matching URLs alert. Removed URLs are ignored."""
+    log.info("Checking Virgin product sitemap...")
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc)
+        raise
+
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        async with AsyncSession(impersonate="chrome") as cf:
+            try:
+                await cf.get("https://www.virginmegastore.ae/en/", timeout=15)
+            except Exception:
+                pass
+            resp = await cf.get(
+                URLS["virgin_sitemap"],
+                headers={"Referer": "https://www.virginmegastore.ae/en/"},
+                timeout=60,
+            )
+        if resp.status_code != 200:
+            log.warning("Virgin sitemap: HTTP %s", resp.status_code)
+            return state
+
+        body = resp.text
+        if not body.lstrip().startswith("<"):
+            try:
+                import gzip
+                body = gzip.decompress(resp.content).decode("utf-8", "ignore")
+            except Exception:
+                pass
+
+        all_urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body)
+        if len(all_urls) < 1000:
+            # A real product sitemap is tens of thousands of URLs. Anything tiny
+            # is a challenge page / truncated response — never diff against it,
+            # or every product would re-alert as "new" on the next good fetch.
+            log.warning("Virgin sitemap: only %d URLs parsed — treating as failed fetch", len(all_urls))
+            return state
+
+        matched: dict[str, dict] = {}
+        for u in all_urls:
+            term = _sitemap_term(u)
+            if not term:
+                continue
+            title = _slug_title(u)
+            if title_excluded(title):
+                continue
+            matched[u] = {"title": title, "url": u, "price": "N/A", "available": True, "term": term}
+
+        log.info("Virgin sitemap: %d URLs total, %d match watch terms", len(all_urls), len(matched))
+        mark_ok(state, "virgin_sitemap")
+
+        prev = state.get("virgin_sitemap") or {}
+        if not prev:
+            by_term: dict[str, int] = {}
+            for v in matched.values():
+                by_term[v["term"]] = by_term.get(v["term"], 0) + 1
+            summary = ", ".join(f"{n} × '{t}'" for t, n in sorted(by_term.items()))
+            await send_telegram(
+                f"<b>🗺️ VIRGIN SITEMAP WATCH — armed</b>\n"
+                f"Baselined {len(matched)} product URLs ({summary}).\n"
+                f"<i>You'll be alerted when a NEW matching product page is created — "
+                f"usually before it's searchable or on sale.</i>",
+                client,
+            )
+            log.info("Virgin sitemap: baseline armed (%d URLs)", len(matched))
+        else:
+            new = [v for u, v in matched.items() if u not in prev]
+            if new:
+                lines = [f"<b>🗺️🆕 VIRGIN — {len(new)} NEW product page(s) created!</b>",
+                         "<i>Spotted in the catalogue sitemap — may not be searchable or on sale yet. Check the link.</i>"]
+                for v in new:
+                    lines.append(f'  👀 <a href="{v["url"]}">{v["title"]}</a>  <i>({v["term"]})</i>')
+                await send_telegram("\n".join(lines), client)
+                log_events("virgin_sitemap", "new", new)
+                log.info("Virgin sitemap: %d new matching URL(s)", len(new))
+            else:
+                log.info("Virgin sitemap: no new matching URLs")
+
+        # Keep previously-seen URLs even if they drop out of the sitemap, so a
+        # transient omission can't make an old product re-alert as "new".
+        merged = dict(prev)
+        merged.update(matched)
+        state["virgin_sitemap"] = merged
+
+    except Exception as exc:
+        log.error("Virgin sitemap check failed: %s", exc)
+
+    return state
 
 
 # ─── LEGENDS OWN THE GAME ─────────────────────────────────────────────────────
@@ -3146,6 +3278,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
         "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
         "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
+        "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -3153,7 +3286,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -3211,7 +3344,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -3345,6 +3478,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "elctoys" not in DISABLED_RETAILERS and now - last_elctoys >= INTERVALS.get("elctoys", 120):
                 headless_tasks.append(("elctoys", check_elctoys(state, client)))
                 last_elctoys = now
+
+            if "virgin_sitemap" not in DISABLED_RETAILERS and now - last_virgin_sitemap >= INTERVALS.get("virgin_sitemap", 600):
+                headless_tasks.append(("virgin_sitemap", check_virgin_sitemap(state, client)))
+                last_virgin_sitemap = now
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
