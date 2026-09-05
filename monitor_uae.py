@@ -1432,7 +1432,7 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                 log.warning("Amazon.ae: page %d empty/HTTP %s via %s%s",
                             page_num, r.status_code, prof,
                             " — retrying with alternate profile" if attempt == 0 else "")
-                await asyncio.sleep(random.uniform(3, 6))
+                await asyncio.sleep(random.uniform(8, 14))
             return None
 
         partial = False
@@ -1483,7 +1483,9 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                     kept += 1
                 log.info("Amazon.ae [%s]: page %d — %d results, %d relevant",
                          label, page_num, len(items), kept)
-                await asyncio.sleep(random.uniform(2, 4))
+                # Railway's datacenter IP is throttled harder than residential:
+                # pages 2+ 503 at short spacing, so pace the walk generously.
+                await asyncio.sleep(random.uniform(8, 14))
 
         if not any_ok:
             log.warning("Amazon.ae: no page fetched successfully — skipping state update")
@@ -1497,14 +1499,41 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
 
         prev = state.get("amazon_ae") or {}
 
-        # Never baseline from a throttled/partial walk: the products on the
-        # pages we missed would all re-alert as "new" on the next clean pass.
+        # A partial walk must not become a naive baseline (the pages we missed
+        # would all re-alert as "new"). Defer a few times to try for a clean
+        # walk — but Amazon throttles Railway's IP persistently, so never defer
+        # forever or Amazon would never arm at all. After MAX_DEFER attempts,
+        # baseline on what we have and set a flag: the next walk that reveals
+        # more products absorbs them silently instead of alerting.
+        MAX_DEFER = 3
         if not prev and partial:
-            log.warning("Amazon.ae: partial walk on first run (%d products) — deferring baseline "
-                        "until a complete pass", len(current))
+            n = int(state.get("_amazon_deferrals", 0)) + 1
+            state["_amazon_deferrals"] = n
+            if n <= MAX_DEFER:
+                log.warning("Amazon.ae: partial walk on first run (%d products) — deferring baseline "
+                            "(%d/%d)", len(current), n, MAX_DEFER)
+                return state
+            log.warning("Amazon.ae: still partial after %d attempts — baselining on %d products "
+                        "and absorbing the rest silently", n, len(current))
+            state["_amazon_partial_baseline"] = True
+
+        # Absorb-mode: baseline was partial, so products newly visible now are
+        # almost certainly ones we simply could not see, not genuine arrivals.
+        if prev and state.get("_amazon_partial_baseline"):
+            unseen = [a for a in current if a not in prev]
+            if unseen:
+                log.info("Amazon.ae: absorbing %d previously-unreachable product(s) silently "
+                         "(partial baseline)", len(unseen))
+            if not partial:
+                state["_amazon_partial_baseline"] = False
+                log.info("Amazon.ae: first complete walk — normal alerting resumes")
+            merged = dict(prev)
+            merged.update(current)
+            state["amazon_ae"] = merged
             return state
 
         if not prev:
+            state["_amazon_deferrals"] = 0
             in_stock = [v for v in current.values() if v["available"]]
             anniv    = [v for v in current.values() if v["term"] == "30th anniversary"]
             lines = [f"<b>📦 AMAZON.AE — Monitoring Started ({len(current)} relevant products)</b>"]
