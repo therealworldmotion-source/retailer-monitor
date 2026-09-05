@@ -121,8 +121,12 @@ def _config_from_env() -> dict | None:
             "little_things": "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250",
             "little_things_onepiece": "https://littlethingsme.com/collections/one-piece-tcg/products.json?limit=250",
             "toycorner": "https://toycorner.ae/product-category/trading-cards-toy-corner/anime-trading-cards/pokemon-trading-cards/",
-            "kinokuniya": "https://uae.kinokuniya.com/products?is_searching=true&keywords=pokemon+tcg",
-            "kinokuniya_accented": "https://uae.kinokuniya.com/products?is_searching=true&keywords=Pok%C3%A9mon+tcg",
+            # Kinokuniya's search is SINGLE-TOKEN: any multi-word query returns
+            # "No results" (so the old "pokemon tcg" was permanently blind, and
+            # would have missed launch day). "tcg" is 4 pages and every Pokemon
+            # TCG title there contains "TCG"; Pokemon-filtering happens in code.
+            "kinokuniya": "https://uae.kinokuniya.com/products?is_searching=true&keywords=tcg",
+            "kinokuniya_accented": "",
             # Curated Pokémon drop/event page(s). Comma-separate more IDs via env if needed.
             "kinokuniya_event": "https://uae.kinokuniya.com/events/1243",
             # Lorcana search URLs (dormant until 7am BST 2026-07-19 via lorcana_active()).
@@ -1902,8 +1906,12 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                 pass
 
             for su in search_urls:
+              # Paginate — the 'tcg' search runs to ~5 pages and a Pokemon item
+              # can sit on any of them.
+              for page_num in range(1, 9):
+                page_url = su if page_num == 1 else f"{su}&page={page_num}"
                 resp = await cf.get(
-                    su,
+                    page_url,
                     headers={
                         "Referer": "https://uae.kinokuniya.com/",
                         "Accept-Language": "en-US,en;q=0.9",
@@ -1911,13 +1919,16 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                     timeout=25,
                 )
                 if resp.status_code != 200:
-                    log.warning("Kinokuniya: HTTP %s for %s", resp.status_code, su)
-                    continue
+                    log.warning("Kinokuniya: HTTP %s for %s", resp.status_code, page_url)
+                    break
                 any_ok = True
 
                 soup  = BeautifulSoup(resp.text, "html.parser")
                 boxes = soup.select("div#image_or_detail div.box")
-                log.info("Kinokuniya: %d product card(s) for %s", len(boxes), su.split("keywords=")[-1])
+                log.info("Kinokuniya: %d product card(s) for %s page %d",
+                         len(boxes), su.split("keywords=")[-1], page_num)
+                if not boxes:
+                    break
 
                 for box in boxes:
                     link = box.select_one("a[href*='/bw/']")
@@ -1941,6 +1952,11 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
 
                     prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
 
+                    # The 'tcg' search returns every TCG brand (Yu-Gi-Oh, Digimon...),
+                    # so keep only Pokemon here.
+                    if not is_pokemon_title(title):
+                        continue
+
                     current[barcode] = {
                         "title":     title,
                         "url":       prod_url,
@@ -1952,8 +1968,14 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
         if not any_ok:
             log.warning("Kinokuniya: all searches failed — skipping state update")
             return state
+        # Kinokuniya only carries Pokemon TCG on launch day, then it sells out
+        # and delists — so 0 products is the normal resting state, NOT a fault.
+        # Mark healthy (no false FAILING alerts) and keep state empty so the
+        # next launch alerts as new products.
         if not current:
-            log.warning("Kinokuniya: no products parsed — selectors may have changed")
+            log.info("Kinokuniya: fetched OK, 0 Pokemon TCG products (normal between launches)")
+            mark_ok(state, "kinokuniya")
+            state["kinokuniya"] = {}
             return state
 
         log.info("Kinokuniya: %d unique product(s) across %d search term(s)", len(current), len(search_urls))
