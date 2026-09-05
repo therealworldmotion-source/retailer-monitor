@@ -108,6 +108,10 @@ def _config_from_env() -> dict | None:
             "littlethings_sitemap_index": "https://littlethingsme.com/sitemap.xml",
             "littlethings_collections": "https://littlethingsme.com/collections.json?limit=250",
             "amazon_ae": "https://www.amazon.ae/s?k=Pok%C3%A9mon",
+            # Amazon ranks by RELEVANCE, so brand-new listings sink and never
+            # reach page 1-4. A newest-first pass surfaced 91 ASINs that the
+            # relevance scan never saw — essential for "what comes in".
+            "amazon_ae_newest": "https://www.amazon.ae/s?k=Pok%C3%A9mon&s=date-desc-rank",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
@@ -1359,7 +1363,13 @@ AMAZON_TCG_HINTS = (
 AMAZON_ANNIV_HINTS = ("30th", "anniversary")
 # Explicit junk cuts — these slip past the hints above.
 AMAZON_JUNK = ("sticker", "pencil case", "colouring", "coloring", "guide to", "handbook",
-               "psa graded", "graded and authenticated", "single card", "sleeve protector")
+               "psa graded", "graded and authenticated", "single card", "sleeve protector",
+               # accessories that would otherwise pass on the word "tcg"
+               "deck box", "deck buddies", "card sleeve", "sleeves", "binder", "portfolio",
+               "playmat", "play mat", "toploader", "top loader", "card case", "storage box",
+               "backpack", "plush", "funko", "figure", "keychain", "lunch", "water bottle",
+               # graded/among singles
+               "illustration rare", "double rare", "/159", "/159 ")
 
 
 def _amazon_relevant(title: str) -> str | None:
@@ -1394,10 +1404,16 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
         random.shuffle(imps)
         any_ok = False
 
-        async def _fetch_page(page_num: int):
+        # (label, base url, pages). Relevance gives the established catalogue;
+        # newest-first is what actually catches brand-new listings.
+        searches = [("relevance", URLS["amazon_ae"], 4)]
+        if URLS.get("amazon_ae_newest"):
+            searches.append(("newest", URLS["amazon_ae_newest"], 2))
+
+        async def _fetch_page(base_url: str, page_num: int):
             """Fetch one results page, retrying with the alternate impersonation
             profile — Amazon intermittently serves an empty/503 shell."""
-            url = URLS["amazon_ae"] + (f"&page={page_num}" if page_num > 1 else "")
+            url = base_url + (f"&page={page_num}" if page_num > 1 else "")
             for attempt, prof in enumerate(imps):
                 async with AsyncSession(impersonate=prof) as cf:
                     r = await cf.get(
@@ -1419,10 +1435,14 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                 await asyncio.sleep(random.uniform(3, 6))
             return None
 
-        if True:
-            for page_num in range(1, 5):   # 4 pages ~ 170 unique listings
-                items = await _fetch_page(page_num)
+        partial = False
+        for label, base_url, n_pages in searches:
+            for page_num in range(1, n_pages + 1):
+                items = await _fetch_page(base_url, page_num)
                 if not items:
+                    # A page we expected did not come back (Amazon throttling).
+                    # The walk is incomplete — must not be used as a baseline.
+                    partial = True
                     break
                 any_ok = True
 
@@ -1461,7 +1481,8 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                     current[asin] = {"title": title, "url": prod_url, "price": price,
                                      "available": available, "term": term}
                     kept += 1
-                log.info("Amazon.ae: page %d — %d results, %d relevant", page_num, len(items), kept)
+                log.info("Amazon.ae [%s]: page %d — %d results, %d relevant",
+                         label, page_num, len(items), kept)
                 await asyncio.sleep(random.uniform(2, 4))
 
         if not any_ok:
@@ -1471,10 +1492,18 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
             log.warning("Amazon.ae: 0 relevant products parsed — filters or layout may have changed")
             return state
 
-        log.info("Amazon.ae: %d relevant product(s)", len(current))
+        log.info("Amazon.ae: %d relevant product(s)%s", len(current), " [PARTIAL]" if partial else "")
         mark_ok(state, "amazon_ae")
 
         prev = state.get("amazon_ae") or {}
+
+        # Never baseline from a throttled/partial walk: the products on the
+        # pages we missed would all re-alert as "new" on the next clean pass.
+        if not prev and partial:
+            log.warning("Amazon.ae: partial walk on first run (%d products) — deferring baseline "
+                        "until a complete pass", len(current))
+            return state
+
         if not prev:
             in_stock = [v for v in current.values() if v["available"]]
             anniv    = [v for v in current.values() if v["term"] == "30th anniversary"]
