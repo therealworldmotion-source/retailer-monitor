@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 300, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -107,6 +107,7 @@ def _config_from_env() -> dict | None:
             "virgin_sitemap": "https://www.virginmegastore.ae/sitemap/PRODUCT-en-AED.xml",
             "littlethings_sitemap_index": "https://littlethingsme.com/sitemap.xml",
             "littlethings_collections": "https://littlethingsme.com/collections.json?limit=250",
+            "amazon_ae": "https://www.amazon.ae/s?k=Pok%C3%A9mon",
             "legends_own_the_game": "https://legendsownthegame.com/products/search?keyword=pokemon&categories=176121252",
             "colorland_toys": "https://colorlandtoys.com/search?q=pokemon+tcg&options%5Bprefix%5D=last&type=product",
             "colorland_toys_accented": "https://colorlandtoys.com/search?q=Pok%C3%A9mon+tcg&options%5Bprefix%5D=last&type=product",
@@ -265,6 +266,7 @@ def load_state() -> dict:
         "elctoys":              {},
         "virgin_sitemap":       {},
         "littlethings_backend": {},
+        "amazon_ae":            {},
     }
 
 
@@ -323,6 +325,7 @@ RETAILER_LABELS = {
     "elctoys":                   "🧸 ELC Toys",
     "virgin_sitemap":            "🗺️ Virgin Sitemap Watch",
     "littlethings_backend":      "🗺️ Little Things Backend",
+    "amazon_ae":                 "📦 Amazon.ae",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -1332,6 +1335,193 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
 
     except Exception as exc:
         log.error("Little Things backend check failed: %s", exc)
+    return state
+
+
+# ─── AMAZON.AE ────────────────────────────────────────────────────────────────
+#
+# Amazon blocks plain httpx (503). curl_cffi with chrome120 / safari17_0 gets
+# through reliably (6/6 in testing); "chrome" and firefox impersonations 503,
+# so only the two known-good profiles are used, alternating per pass.
+#
+# The broad "Pokémon" search is ~48 results/page of mostly noise (plush, books,
+# stickers, stationery), so results are filtered to genuine sealed TCG plus
+# anything anniversary-related. Alerts on NEW listings and restocks.
+
+AMAZON_IMPERSONATIONS = ("chrome120", "safari17_0")
+
+AMAZON_TCG_HINTS = (
+    "tcg", "elite trainer", "etb", "booster bundle", "booster box", "booster pack",
+    "booster display", "blister", "trading card", "premium collection", "ultra premium",
+    "card game", "expansion pack", "sleeved booster", "build & battle", "build and battle",
+    "league battle deck", "surprise box", "tin",
+)
+AMAZON_ANNIV_HINTS = ("30th", "anniversary")
+# Explicit junk cuts — these slip past the hints above.
+AMAZON_JUNK = ("sticker", "pencil case", "colouring", "coloring", "guide to", "handbook",
+               "psa graded", "graded and authenticated", "single card", "sleeve protector")
+
+
+def _amazon_relevant(title: str) -> str | None:
+    t = strip_accents(title)
+    if any(j in t for j in AMAZON_JUNK):
+        return None
+    if any(h in t for h in AMAZON_ANNIV_HINTS):
+        return "30th anniversary"
+    if "pokemon" not in t and "pikachu" not in t:
+        return None
+    if any(h in t for h in AMAZON_TCG_HINTS):
+        return "pokemon tcg"
+    return None
+
+
+async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
+    """Amazon.ae — broad 'Pokémon' search, filtered to sealed TCG + anniversary.
+
+    Tracked by ASIN. Alerts on new listings appearing and on out-of-stock ->
+    in-stock transitions."""
+    log.info("Checking Amazon.ae...")
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as exc:
+        log.error("curl_cffi not available: %s", exc)
+        raise
+
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        imps = list(AMAZON_IMPERSONATIONS)
+        random.shuffle(imps)
+        any_ok = False
+
+        async def _fetch_page(page_num: int):
+            """Fetch one results page, retrying with the alternate impersonation
+            profile — Amazon intermittently serves an empty/503 shell."""
+            url = URLS["amazon_ae"] + (f"&page={page_num}" if page_num > 1 else "")
+            for attempt, prof in enumerate(imps):
+                async with AsyncSession(impersonate=prof) as cf:
+                    r = await cf.get(
+                        url,
+                        headers={"Accept-Language": "en-AE,en;q=0.9",
+                                 "Referer": "https://www.amazon.ae/"},
+                        timeout=30,
+                    )
+                if r.status_code == 200:
+                    sp = BeautifulSoup(r.text, "html.parser")
+                    it = sp.select('div[data-component-type="s-search-result"]')
+                    if not it:
+                        it = [d for d in sp.select("div[data-asin]") if d.get("data-asin")]
+                    if it:
+                        return it
+                log.warning("Amazon.ae: page %d empty/HTTP %s via %s%s",
+                            page_num, r.status_code, prof,
+                            " — retrying with alternate profile" if attempt == 0 else "")
+                await asyncio.sleep(random.uniform(3, 6))
+            return None
+
+        if True:
+            for page_num in range(1, 5):   # 4 pages ~ 170 unique listings
+                items = await _fetch_page(page_num)
+                if not items:
+                    break
+                any_ok = True
+
+                kept = 0
+                for it in items:
+                    asin = it.get("data-asin", "")
+                    if not asin:
+                        continue
+                    h = it.select_one("h2 a span") or it.select_one("h2 span") or it.select_one("h2")
+                    title = h.get_text(" ", strip=True) if h else ""
+                    if not title or len(title) < 5:
+                        continue
+                    if title_excluded(title):
+                        continue
+                    term = _amazon_relevant(title)
+                    if not term:
+                        continue
+
+                    a = it.select_one("h2 a") or it.select_one("a.a-link-normal[href*='/dp/']")
+                    href = a.get("href", "") if a else ""
+                    prod_url = (href if href.startswith("http")
+                                else f"https://www.amazon.ae{href}") if href else f"https://www.amazon.ae/dp/{asin}"
+
+                    whole = it.select_one(".a-price .a-price-whole")
+                    frac  = it.select_one(".a-price .a-price-fraction")
+                    if whole:
+                        price = "AED " + whole.get_text(strip=True).rstrip(".")
+                        if frac:
+                            price += "." + frac.get_text(strip=True)
+                    else:
+                        price = "N/A"
+
+                    blob = it.get_text(" ", strip=True).lower()
+                    available = not ("currently unavailable" in blob or "out of stock" in blob)
+
+                    current[asin] = {"title": title, "url": prod_url, "price": price,
+                                     "available": available, "term": term}
+                    kept += 1
+                log.info("Amazon.ae: page %d — %d results, %d relevant", page_num, len(items), kept)
+                await asyncio.sleep(random.uniform(2, 4))
+
+        if not any_ok:
+            log.warning("Amazon.ae: no page fetched successfully — skipping state update")
+            return state
+        if not current:
+            log.warning("Amazon.ae: 0 relevant products parsed — filters or layout may have changed")
+            return state
+
+        log.info("Amazon.ae: %d relevant product(s)", len(current))
+        mark_ok(state, "amazon_ae")
+
+        prev = state.get("amazon_ae") or {}
+        if not prev:
+            in_stock = [v for v in current.values() if v["available"]]
+            anniv    = [v for v in current.values() if v["term"] == "30th anniversary"]
+            lines = [f"<b>📦 AMAZON.AE — Monitoring Started ({len(current)} relevant products)</b>"]
+            if anniv:
+                lines.append(f"\n🎂 <b>Anniversary items ({len(anniv)}):</b>")
+                for v in anniv[:10]:
+                    lines.append(fmt_product(v))
+            lines.append(f"\n✅ <b>In stock ({len(in_stock)}):</b>")
+            for v in in_stock[:20]:
+                lines.append(fmt_product(v))
+            if len(in_stock) > 20:
+                lines.append(f"  ...and {len(in_stock) - 20} more")
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("Amazon.ae: baseline sent (%d products)", len(current))
+        else:
+            new_products, restocked = [], []
+            for asin, prod in current.items():
+                if asin not in prev:
+                    new_products.append(prod)
+                elif prod["available"] and not prev[asin].get("available"):
+                    restocked.append(prod)
+            if new_products:
+                lines = [f"<b>🆕 AMAZON.AE — {len(new_products)} New Listing(s)!</b>"]
+                for v in new_products:
+                    tag = " 🎂" if v["term"] == "30th anniversary" else ""
+                    lines.append(fmt_product(v) + tag)
+                await send_telegram("\n".join(lines), client)
+                log_events("amazon_ae", "new", new_products)
+            if restocked:
+                lines = [f"<b>🟢 AMAZON.AE — {len(restocked)} Back In Stock!</b>"]
+                for v in restocked:
+                    lines.append(fmt_product(v, "✅"))
+                await send_telegram("\n".join(lines), client)
+                log_events("amazon_ae", "restock", restocked)
+            if not (new_products or restocked):
+                log.info("Amazon.ae: no changes")
+
+        merged = dict(prev)
+        merged.update(current)
+        state["amazon_ae"] = merged
+
+    except Exception as exc:
+        log.error("Amazon.ae check failed: %s", exc)
     return state
 
 
@@ -3532,6 +3722,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
         "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
         "littlethings_backend": {"label": "🗺️ Little Things Backend", "ok": None, "time": ""},
+        "amazon_ae":            {"label": "📦 Amazon.ae",             "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -3539,7 +3730,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -3597,7 +3788,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -3739,6 +3930,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "littlethings_backend" not in DISABLED_RETAILERS and now - last_lt_backend >= INTERVALS.get("littlethings_backend", 600):
                 headless_tasks.append(("littlethings_backend", check_littlethings_backend(state, client)))
                 last_lt_backend = now
+
+            if "amazon_ae" not in DISABLED_RETAILERS and now - last_amazon >= INTERVALS.get("amazon_ae", 300):
+                headless_tasks.append(("amazon_ae", check_amazon_ae(state, client)))
+                last_amazon = now
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
