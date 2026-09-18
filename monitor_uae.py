@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -108,6 +108,8 @@ def _config_from_env() -> dict | None:
             "littlethings_sitemap_index": "https://littlethingsme.com/sitemap.xml",
             "littlethings_collections": "https://littlethingsme.com/collections.json?limit=250",
             "amazon_ae": "https://www.amazon.ae/s?k=Pok%C3%A9mon",
+            "pinca":  "https://pinca.ae/collections/pokemon-cards/products.json?limit=250",
+            "toybox": "https://toybox.ae/collections/pokemon/products.json?limit=250",
             # Amazon ranks by RELEVANCE, so brand-new listings sink and never
             # reach page 1-4. A newest-first pass surfaced 91 ASINs that the
             # relevance scan never saw — essential for "what comes in".
@@ -271,6 +273,8 @@ def load_state() -> dict:
         "virgin_sitemap":       {},
         "littlethings_backend": {},
         "amazon_ae":            {},
+        "pinca":                {},
+        "toybox":               {},
     }
 
 
@@ -330,6 +334,8 @@ RETAILER_LABELS = {
     "virgin_sitemap":            "🗺️ Virgin Sitemap Watch",
     "littlethings_backend":      "🗺️ Little Things Backend",
     "amazon_ae":                 "📦 Amazon.ae",
+    "pinca":                     "🅿️ Pinca",
+    "toybox":                    "🧸 Toybox",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -348,6 +354,8 @@ CART_HOSTS = {
     "little_things_onepiece": "littlethingsme.com",
     "elctoys":                "elctoys.com",
     "littlethings_backend":   "littlethingsme.com",
+    "pinca":                  "pinca.ae",
+    "toybox":                 "toybox.ae",
 }
 
 
@@ -1600,6 +1608,145 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
     except Exception as exc:
         log.error("Amazon.ae check failed: %s", exc)
     return state
+
+
+# ─── GENERIC SHOPIFY COLLECTION CHECKER ───────────────────────────────────────
+#
+# Pinca and Toybox are both plain Shopify stores exposing a Pokemon collection
+# via products.json, so one parametrised checker serves both rather than a
+# third and fourth near-identical copy. Variant IDs give cart permalinks.
+
+SHOPIFY_TCG_HINTS = ("tcg", "booster", "elite trainer", "etb", "blister", "deck",
+                     "tin", "collection box", "premium collection", "trading card",
+                     "gift box", "bundle", "card game", "portfolio w/booster")
+
+
+async def check_shopify_collection(
+    state: dict,
+    client: httpx.AsyncClient,
+    *,
+    key: str,
+    host: str,
+    headline: str,
+    log_name: str,
+) -> dict:
+    """Poll a Shopify collection's products.json, keep Pokemon TCG only, and
+    alert on new products and restocks with a tap-to-checkout cart link."""
+    log.info("Checking %s...", log_name)
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        base = URLS[key]
+        page = 1
+        while page <= 5:
+            url = base if page == 1 else f"{base}&page={page}"
+            resp = await client.get(url, headers=get_json_headers(), timeout=25)
+            if resp.status_code != 200:
+                log.warning("%s: HTTP %s on page %d — skipping state update",
+                            log_name, resp.status_code, page)
+                return state
+            products = json.loads(resp.content).get("products", [])
+            if not products:
+                break
+            for pr in products:
+                handle = pr.get("handle", "")
+                title  = pr.get("title", "")
+                if not handle or not title or len(title) < 3:
+                    continue
+                if title_excluded(title):
+                    continue
+                # Pokemon TCG only — these collections also carry Funko, Monopoly
+                # and other brands' TCG (e.g. MetaZoo).
+                if not is_pokemon_title(title):
+                    continue
+                if not any(h in strip_accents(title) for h in SHOPIFY_TCG_HINTS):
+                    continue
+                variants   = pr.get("variants") or [{}]
+                v          = variants[0]
+                available  = any(x.get("available") for x in variants)
+                avail_var  = next((x for x in variants if x.get("available")), v)
+                variant_id = avail_var.get("id") or v.get("id")
+                current[handle] = {
+                    "title": title,
+                    "url": f"https://{host}/products/{handle}",
+                    "price": f"AED {v.get('price', '0')}",
+                    "available": available,
+                    "variant_id": variant_id,
+                }
+            if len(products) < 250:
+                break
+            page += 1
+            await asyncio.sleep(random.uniform(1, 2))
+
+        if not current:
+            log.warning("%s: no Pokemon TCG products parsed", log_name)
+            return state
+
+        log.info("%s: %d Pokemon TCG product(s), %d in stock",
+                 log_name, len(current), sum(1 for v in current.values() if v["available"]))
+        mark_ok(state, key)
+
+        def _cart(pd: dict) -> str:
+            if pd.get("available") and pd.get("variant_id"):
+                return f'\n     <a href="https://{host}/cart/{pd["variant_id"]}:1">🛒 Tap to checkout</a>'
+            return ""
+
+        prev = state.get(key) or {}
+        if not prev:
+            in_stock  = [v for v in current.values() if v["available"]]
+            lines = [f"<b>{headline} — Monitoring Started ({len(current)} products)</b>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                for v in in_stock[:20]:
+                    lines.append(fmt_product(v) + _cart(v))
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("%s: baseline sent (%d products)", log_name, len(current))
+        else:
+            new_products, restocked, went_oos = [], [], []
+            for h, pd in current.items():
+                if h not in prev:
+                    new_products.append(pd)
+                elif pd["available"] != prev[h].get("available"):
+                    (restocked if pd["available"] else went_oos).append(pd)
+            if new_products:
+                lines = [f"<b>🆕 {headline} — {len(new_products)} New Product(s)!</b>"]
+                for v in new_products:
+                    lines.append(fmt_product(v) + _cart(v))
+                await send_telegram("\n".join(lines), client)
+                log_events(key, "new", new_products)
+            if restocked:
+                lines = [f"<b>🟢 {headline} — {len(restocked)} Back In Stock!</b>"]
+                for v in restocked:
+                    lines.append(fmt_product(v, "✅") + _cart(v))
+                await send_telegram("\n".join(lines), client)
+                log_events(key, "restock", restocked)
+            if went_oos:
+                lines = [f"<b>🔴 {headline} — Out of Stock</b>"]
+                for v in went_oos:
+                    lines.append(fmt_product(v, "❌"))
+                await send_telegram("\n".join(lines), client)
+            if not (new_products or restocked or went_oos):
+                log.info("%s: no changes", log_name)
+
+        merged = dict(prev)
+        merged.update(current)
+        state[key] = merged
+    except Exception as exc:
+        log.error("%s check failed: %s", log_name, exc)
+    return state
+
+
+async def check_pinca(state: dict, client: httpx.AsyncClient) -> dict:
+    return await check_shopify_collection(state, client, key="pinca", host="pinca.ae",
+                                          headline="🅿️ PINCA", log_name="Pinca")
+
+
+async def check_toybox(state: dict, client: httpx.AsyncClient) -> dict:
+    return await check_shopify_collection(state, client, key="toybox", host="toybox.ae",
+                                          headline="🧸 TOYBOX", log_name="Toybox")
 
 
 # ─── LEGENDS OWN THE GAME ─────────────────────────────────────────────────────
@@ -3800,6 +3947,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
         "littlethings_backend": {"label": "🗺️ Little Things Backend", "ok": None, "time": ""},
         "amazon_ae":            {"label": "📦 Amazon.ae",             "ok": None, "time": ""},
+        "pinca":                {"label": "🅿️ Pinca",                 "ok": None, "time": ""},
+        "toybox":               {"label": "🧸 Toybox",                "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -3807,7 +3956,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -3865,7 +4014,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -4011,6 +4160,14 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "amazon_ae" not in DISABLED_RETAILERS and now - last_amazon >= INTERVALS.get("amazon_ae", 600):
                 headless_tasks.append(("amazon_ae", check_amazon_ae(state, client)))
                 last_amazon = now
+
+            if "pinca" not in DISABLED_RETAILERS and now - last_pinca >= INTERVALS.get("pinca", 120):
+                headless_tasks.append(("pinca", check_pinca(state, client)))
+                last_pinca = now
+
+            if "toybox" not in DISABLED_RETAILERS and now - last_toybox >= INTERVALS.get("toybox", 120):
+                headless_tasks.append(("toybox", check_toybox(state, client)))
+                last_toybox = now
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
