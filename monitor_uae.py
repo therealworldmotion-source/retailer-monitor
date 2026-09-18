@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "onepiece": 180, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -275,6 +275,9 @@ def load_state() -> dict:
         "amazon_ae":            {},
         "pinca":                {},
         "toybox":               {},
+        "otakume_onepiece":     {},
+        "legends_onepiece":     {},
+        "amazon_onepiece":      {},
     }
 
 
@@ -336,6 +339,9 @@ RETAILER_LABELS = {
     "amazon_ae":                 "📦 Amazon.ae",
     "pinca":                     "🅿️ Pinca",
     "toybox":                    "🧸 Toybox",
+    "otakume_onepiece":          "🏴\u200d☠️ Otakume (OP)",
+    "legends_onepiece":          "🏴\u200d☠️ Legends (OP)",
+    "amazon_onepiece":           "🏴\u200d☠️ Amazon (OP)",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -1747,6 +1753,225 @@ async def check_pinca(state: dict, client: httpx.AsyncClient) -> dict:
 async def check_toybox(state: dict, client: httpx.AsyncClient) -> dict:
     return await check_shopify_collection(state, client, key="toybox", host="toybox.ae",
                                           headline="🧸 TOYBOX", log_name="Toybox")
+
+
+# ─── ONE PIECE TCG WATCHERS ───────────────────────────────────────────────────
+#
+# One Piece was only covered at Virgin and Little Things. A survey of all 14
+# retailers found three more that genuinely stock One Piece CARD GAME product:
+#   Amazon.ae (~41), Legends (~25), Otakume (~6, all in stock).
+# The rest carry only Banpresto figures / Ultimate Guard sleeves, so adding
+# watchers there would be pure noise.
+
+ONEPIECE_ACCESSORY_WORDS = ("sleeve", "binder", "folio", "toploader", "top loader",
+                            "deck box", "playmat", "play mat", "card case", "xenoskin",
+                            "ultimate guard", "protector", "figure", "plush", "keychain",
+                            "key chain", "banpresto", "statue", "chogokin")
+ONEPIECE_TCG_HINTS = ("card game", "booster", "starter deck", "tcg", "blister",
+                      "premium booster", "op-0", "op-1", "eb-0", "prb-0", "st-3", "st-2")
+
+
+def _is_onepiece_product(title: str) -> bool:
+    t = strip_accents(title)
+    if "one piece" not in t:
+        return False
+    if any(w in t for w in ONEPIECE_ACCESSORY_WORDS):
+        return False
+    return any(h in t for h in ONEPIECE_TCG_HINTS)
+
+
+async def _onepiece_diff_and_alert(state: dict, client: httpx.AsyncClient,
+                                   state_key: str, headline: str, current: dict) -> None:
+    """Shared baseline + new/restock/OOS alerting for the One Piece watchers.
+    Mirrors the Lorcana helper, including the armed-but-empty case."""
+    started_key = f"_{state_key}_started"
+    prev = state.get(state_key, {})
+
+    if not state.get(started_key):
+        if current:
+            in_stock = [p for p in current.values() if p.get("available")]
+            lines = [f"<b>{headline} — Monitoring Started ({len(current)} product{'s' if len(current)!=1 else ''})</b>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                for p in in_stock[:20]:
+                    lines.append(fmt_product(p))
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("%s: baseline sent (%d products)", state_key, len(current))
+        else:
+            log.info("%s: armed — 0 One Piece products yet", state_key)
+        state[started_key] = True
+    else:
+        new_products = [p for k, p in current.items() if k not in prev]
+        restocked    = [p for k, p in current.items() if k in prev and p.get("available") and not prev[k].get("available")]
+        went_oos     = [p for k, p in current.items() if k in prev and not p.get("available") and prev[k].get("available")]
+        if new_products:
+            lines = [f"<b>🆕 {headline} — {len(new_products)} New One Piece Product(s)!</b>"]
+            for p in new_products:
+                lines.append(fmt_product(p))
+            await send_telegram("\n".join(lines), client)
+            log_events(state_key, "new", new_products)
+        if restocked:
+            lines = [f"<b>🟢 {headline} — Back In Stock!</b>"]
+            for p in restocked:
+                lines.append(fmt_product(p, "✅"))
+            await send_telegram("\n".join(lines), client)
+            log_events(state_key, "restock", restocked)
+        if went_oos:
+            lines = [f"<b>🔴 {headline} — Out of Stock</b>"]
+            for p in went_oos:
+                lines.append(fmt_product(p, "❌"))
+            await send_telegram("\n".join(lines), client)
+        if not (new_products or restocked or went_oos):
+            log.info("%s: no changes (%d products)", state_key, len(current))
+    state[state_key] = current
+
+
+async def check_otakume_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
+    """Otakume — dedicated /collections/one-piece (Shopify JSON)."""
+    log.info("Checking Otakume (One Piece)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        page = 1
+        while page <= 3:
+            url = f"https://otakume.com/collections/one-piece/products.json?limit=250&page={page}"
+            r = await client.get(url, headers=get_json_headers(), timeout=25)
+            if r.status_code != 200:
+                log.warning("Otakume One Piece: HTTP %s", r.status_code)
+                if page == 1:
+                    return state
+                break
+            prods = json.loads(r.content).get("products", [])
+            if not prods:
+                break
+            for pr in prods:
+                title = pr.get("title", "")
+                if not _is_onepiece_product(title) or title_excluded(title):
+                    continue
+                vs = pr.get("variants") or [{}]
+                v  = vs[0]
+                current[pr.get("handle", title)] = {
+                    "title": title,
+                    "url": f"https://otakume.com/products/{pr.get('handle','')}",
+                    "price": f"AED {v.get('price','0')}",
+                    "available": any(x.get("available") for x in vs),
+                }
+            if len(prods) < 250:
+                break
+            page += 1
+            await asyncio.sleep(random.uniform(1, 2))
+        mark_ok(state, "otakume_onepiece")
+        await _onepiece_diff_and_alert(state, client, "otakume_onepiece", "🏴‍☠️ OTAKUME (OP)", current)
+    except Exception as exc:
+        log.error("Otakume One Piece check failed: %s", exc)
+    return state
+
+
+async def check_legends_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
+    """Legends Own The Game — Ecwid API keyword search."""
+    log.info("Checking Legends (One Piece)...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        offset = 0
+        while True:
+            api = (f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
+                   f"?keyword=one%20piece&enabled=true&limit=100&offset={offset}&lang=en")
+            r = await client.get(api, headers={"Authorization": f"Bearer {ECWID_TOKEN}",
+                                               "Accept": "application/json",
+                                               "User-Agent": random.choice(USER_AGENTS)}, timeout=25)
+            if r.status_code != 200:
+                log.warning("Legends One Piece: HTTP %s", r.status_code)
+                if offset == 0:
+                    return state
+                break
+            data  = r.json()
+            items = data.get("items", [])
+            total = data.get("total", 0)
+            for it in items:
+                name = it.get("name", "")
+                if not _is_onepiece_product(name) or title_excluded(name):
+                    continue
+                current[product_key(name)] = {
+                    "title": name, "url": it.get("url", ""),
+                    "price": it.get("defaultDisplayedPriceFormatted", "N/A"),
+                    "available": bool(it.get("inStock", False)),
+                }
+            offset += len(items)
+            if not items or offset >= total:
+                break
+        mark_ok(state, "legends_onepiece")
+        await _onepiece_diff_and_alert(state, client, "legends_onepiece", "🏴‍☠️ LEGENDS (OP)", current)
+    except Exception as exc:
+        log.error("Legends One Piece check failed: %s", exc)
+    return state
+
+
+async def check_amazon_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
+    """Amazon.ae — 'one piece card game' search. Shares Amazon's backoff window,
+    since a block applies to the whole domain, not one query."""
+    until = float(state.get("_amazon_backoff_until", 0) or 0)
+    if until and time.time() < until:
+        log.info("Amazon One Piece: in Amazon backoff — skipping")
+        return state
+    log.info("Checking Amazon (One Piece)...")
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        return state
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        imps = list(AMAZON_IMPERSONATIONS); random.shuffle(imps)
+        got = False
+        for page_num in (1, 2):
+            url = "https://www.amazon.ae/s?k=one+piece+card+game" + (f"&page={page_num}" if page_num > 1 else "")
+            items = None
+            for prof in imps:
+                async with AsyncSession(impersonate=prof) as cf:
+                    r = await cf.get(url, headers={"Accept-Language": "en-AE,en;q=0.9",
+                                                   "Referer": "https://www.amazon.ae/"}, timeout=30)
+                if r.status_code == 200:
+                    sp = BeautifulSoup(r.text, "html.parser")
+                    cand = sp.select('div[data-component-type="s-search-result"]')
+                    if cand:
+                        items = cand
+                        break
+                await asyncio.sleep(random.uniform(8, 14))
+            if not items:
+                log.warning("Amazon One Piece: page %d unavailable", page_num)
+                break
+            got = True
+            for it in items:
+                asin = it.get("data-asin", "")
+                h = it.select_one("h2 a span") or it.select_one("h2 span")
+                title = h.get_text(" ", strip=True) if h else ""
+                if not asin or not title or not _is_onepiece_product(title) or title_excluded(title):
+                    continue
+                a = it.select_one("h2 a")
+                href = a.get("href", "") if a else ""
+                whole = it.select_one(".a-price .a-price-whole")
+                frac  = it.select_one(".a-price .a-price-fraction")
+                price = ("AED " + whole.get_text(strip=True).rstrip(".") + ("." + frac.get_text(strip=True) if frac else "")) if whole else "N/A"
+                blob = it.get_text(" ", strip=True).lower()
+                current[asin] = {
+                    "title": title,
+                    "url": (href if href.startswith("http") else f"https://www.amazon.ae{href}") if href else f"https://www.amazon.ae/dp/{asin}",
+                    "price": price,
+                    "available": not ("currently unavailable" in blob or "out of stock" in blob),
+                }
+            await asyncio.sleep(random.uniform(8, 14))
+        if not got:
+            log.warning("Amazon One Piece: no page fetched — skipping state update")
+            return state
+        mark_ok(state, "amazon_onepiece")
+        await _onepiece_diff_and_alert(state, client, "amazon_onepiece", "🏴‍☠️ AMAZON (OP)", current)
+    except Exception as exc:
+        log.error("Amazon One Piece check failed: %s", exc)
+    return state
 
 
 # ─── LEGENDS OWN THE GAME ─────────────────────────────────────────────────────
@@ -3949,6 +4174,9 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "amazon_ae":            {"label": "📦 Amazon.ae",             "ok": None, "time": ""},
         "pinca":                {"label": "🅿️ Pinca",                 "ok": None, "time": ""},
         "toybox":               {"label": "🧸 Toybox",                "ok": None, "time": ""},
+        "amazon_onepiece":     {"label": "🏴‍☠️ Amazon (OP)",      "ok": None, "time": ""},
+        "legends_onepiece":     {"label": "🏴‍☠️ Legends (OP)",      "ok": None, "time": ""},
+        "otakume_onepiece":     {"label": "🏴‍☠️ Otakume (OP)",      "ok": None, "time": ""},
     }
     # Lorcana watchers — added to the board (shown ⏳ until 7am BST go-live).
     for _sk, _fn, _label in LORCANA_CHECKS:
@@ -3956,7 +4184,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -4014,7 +4242,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = last_onepiece = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -4168,6 +4396,14 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "toybox" not in DISABLED_RETAILERS and now - last_toybox >= INTERVALS.get("toybox", 120):
                 headless_tasks.append(("toybox", check_toybox(state, client)))
                 last_toybox = now
+
+            if now - last_onepiece >= INTERVALS.get("onepiece", 180):
+                last_onepiece = now
+                for _k, _fn in (("otakume_onepiece", check_otakume_onepiece),
+                                ("legends_onepiece", check_legends_onepiece),
+                                ("amazon_onepiece",  check_amazon_onepiece)):
+                    if _k not in DISABLED_RETAILERS:
+                        headless_tasks.append((_k, _fn(state, client)))
 
             # ── Lorcana watchers — dormant until 7am BST go-live, then every 2 min ──
             if lorcana_active():
