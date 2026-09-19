@@ -637,6 +637,69 @@ def is_pokemon_title(title: str) -> bool:
     return "pokemon" in t or "pikachu" in t
 
 
+# ─── PRICE CHANGE DETECTION ───────────────────────────────────────────────────
+# Nothing tracked price before, so a listing going live near RRP and then being
+# re-priced (or a scalper price falling back to RRP) was invisible. A drop is
+# the buy signal; rises are logged but alerted quietly.
+
+PRICE_ALERT_MIN_PCT = float(os.environ.get("PRICE_ALERT_MIN_PCT", "5"))
+
+
+def price_value(price) -> float | None:
+    """'AED 1,205.63' / 'AED 99.00' / 1205.63 -> float. None if unparseable."""
+    if price is None:
+        return None
+    if isinstance(price, (int, float)):
+        return float(price)
+    m = re.search(r"[\d][\d,\s]*(?:\.\d+)?", str(price))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", "").replace(" ", ""))
+    except Exception:
+        return None
+
+
+def detect_price_changes(prev: dict, current: dict, min_pct: float | None = None):
+    """Compare prices between two product maps.
+
+    Returns (drops, rises); each entry is (product, old_price_str, new_price_str,
+    pct_change). Only moves of at least min_pct are reported, so rounding and
+    VAT jitter don't spam."""
+    if min_pct is None:
+        min_pct = PRICE_ALERT_MIN_PCT
+    drops, rises = [], []
+    for k, cur in (current or {}).items():
+        old = (prev or {}).get(k)
+        if not isinstance(old, dict) or not isinstance(cur, dict):
+            continue
+        ov, nv = price_value(old.get("price")), price_value(cur.get("price"))
+        if ov is None or nv is None or ov <= 0 or nv <= 0 or ov == nv:
+            continue
+        pct = (nv - ov) / ov * 100.0
+        if abs(pct) < min_pct:
+            continue
+        (drops if nv < ov else rises).append((cur, old.get("price"), cur.get("price"), pct))
+    return drops, rises
+
+
+async def alert_price_changes(state_key: str, headline: str, prev: dict, current: dict,
+                              client: httpx.AsyncClient) -> None:
+    """Send a price-drop alert (loud) and a price-rise note (quiet)."""
+    drops, rises = detect_price_changes(prev, current)
+    if drops:
+        lines = [f"<b>💰 {headline} — {len(drops)} PRICE DROP(S)!</b>"]
+        for pd, oldp, newp, pct in sorted(drops, key=lambda x: x[3]):
+            stock = "✅" if pd.get("available") else "❌"
+            lines.append(f'  {stock} <a href="{pd.get("url","")}">{pd.get("title","")[:70]}</a>\n'
+                         f'     <s>{oldp}</s> → <b>{newp}</b>  ({pct:+.0f}%)')
+        await send_telegram("\n".join(lines), client)
+        log_events(state_key, "price_drop", [d[0] for d in drops])
+    if rises:
+        log.info("%s: %d price rise(s) (largest %+.0f%%)", state_key, len(rises),
+                 max(r[3] for r in rises))
+
+
 def product_key(title: str) -> str:
     """Normalise a product title to a stable dictionary key."""
     return title.lower().strip().replace(" ", "-").replace("/", "-")[:80]
@@ -811,6 +874,7 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
                 await send_telegram("\n".join(lines), client)
                 log_events("otakume", "oos", went_oos)
 
+            await alert_price_changes("otakume", "🟡 OTAKUME", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("Otakume: no changes")
 
@@ -1000,6 +1064,7 @@ async def check_virgin_megastore(
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
                 log_events(state_key, "oos", went_oos)
+            await alert_price_changes(state_key, headline, prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("%s: no changes", log_name)
 
@@ -1604,6 +1669,7 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                     lines.append(fmt_product(v, "✅"))
                 await send_telegram("\n".join(lines), client)
                 log_events("amazon_ae", "restock", restocked)
+            await alert_price_changes("amazon_ae", "📦 AMAZON.AE", prev, current, client)
             if not (new_products or restocked):
                 log.info("Amazon.ae: no changes")
 
@@ -1734,6 +1800,7 @@ async def check_shopify_collection(
                 for v in went_oos:
                     lines.append(fmt_product(v, "❌"))
                 await send_telegram("\n".join(lines), client)
+            await alert_price_changes(key, headline, prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("%s: no changes", log_name)
 
@@ -1824,6 +1891,7 @@ async def _onepiece_diff_and_alert(state: dict, client: httpx.AsyncClient,
             for p in went_oos:
                 lines.append(fmt_product(p, "❌"))
             await send_telegram("\n".join(lines), client)
+        await alert_price_changes(state_key, headline, prev, current, client)
         if not (new_products or restocked or went_oos):
             log.info("%s: no changes (%d products)", state_key, len(current))
     state[state_key] = current
@@ -2167,6 +2235,7 @@ async def check_legends_own_the_game(state: dict, client: httpx.AsyncClient) -> 
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+            await alert_price_changes("legends_own_the_game", "🎴 LEGENDS", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("Legends Own The Game: no changes")
 
@@ -2340,6 +2409,7 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
                 log_events("colorland_toys", "oos", went_oos)
+            await alert_price_changes("colorland_toys", "🧩 COLORLAND TOYS", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("Colorland Toys: no changes")
 
@@ -2490,6 +2560,7 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
                 log_events("toycorner", "oos", went_oos)
+            await alert_price_changes("toycorner", "🧸 TOY CORNER", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("Toy Corner: no changes")
 
@@ -2964,6 +3035,7 @@ async def _lorcana_diff_and_alert(state: dict, client: httpx.AsyncClient,
             for p in went_oos:
                 lines.append(fmt_product(p, "❌"))
             await send_telegram("\n".join(lines), client)
+        await alert_price_changes(state_key, headline, prev, current, client)
         if not (new_products or restocked or went_oos):
             log.info("%s: no changes (%d products)", state_key, len(current))
 
@@ -3429,6 +3501,7 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
                 log_events("elctoys", "oos", went_oos)
+            await alert_price_changes("elctoys", "🧸 ELC TOYS", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("ELC Toys: no changes")
 
@@ -3638,6 +3711,7 @@ async def check_zgames(state: dict, client: httpx.AsyncClient, context: BrowserC
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+            await alert_price_changes("zgames", "🎮 ZGAMES", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("ZGames: no changes")
 
@@ -3755,6 +3829,7 @@ async def check_geekay(state: dict, client: httpx.AsyncClient) -> dict:
                 for p in went_oos:
                     lines.append(fmt_product(p, "❌"))
                 await send_telegram("\n".join(lines), client)
+            await alert_price_changes("geekay", "🛒 GEEKAY", prev, current, client)
             if not (new_products or restocked or went_oos):
                 log.info("Geekay: no changes")
 
@@ -3960,6 +4035,7 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
 
             if went_oos:
                 log.info("Little Things: %d went OOS (not alerting)", len(went_oos))
+            await alert_price_changes("little_things", "🛍️ LITTLE THINGS", prev, current, client)
             if not (new_products or restocked):
                 log.info("Little Things: no changes")
 
@@ -4064,6 +4140,7 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
                 await send_telegram("\n".join(lines), client)
             if went_oos:
                 log.info("Little Things OP: %d went OOS (not alerting)", len(went_oos))
+            await alert_price_changes("little_things_onepiece", "🏴\u200d☠️ LITTLE THINGS (OP)", prev, current, client)
             if not (new_products or restocked):
                 log.info("Little Things OP: no changes")
 
