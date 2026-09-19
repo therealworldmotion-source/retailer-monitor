@@ -94,7 +94,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "onepiece": 180, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "onepiece": 180, "dabdoob": 600, "lorcana": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -110,6 +110,9 @@ def _config_from_env() -> dict | None:
             "amazon_ae": "https://www.amazon.ae/s?k=Pok%C3%A9mon",
             "pinca":  "https://pinca.ae/collections/pokemon-cards/products.json?limit=250",
             "toybox": "https://toybox.ae/collections/pokemon/products.json?limit=250",
+            # Dabdoob: Next.js app, client-rendered search + signed API (x-hash), so we
+            # use the product sitemap (new listings) + SSR product pages (JSON-LD).
+            "dabdoob_sitemap": "https://dabdoob.com/_static_/sitemap/en-AE/products",   # trailing slash 308s
             # Amazon ranks by RELEVANCE, so brand-new listings sink and never
             # reach page 1-4. A newest-first pass surfaced 91 ASINs that the
             # relevance scan never saw — essential for "what comes in".
@@ -278,6 +281,7 @@ def load_state() -> dict:
         "otakume_onepiece":     {},
         "legends_onepiece":     {},
         "amazon_onepiece":      {},
+        "dabdoob":              {},
     }
 
 
@@ -342,6 +346,7 @@ RETAILER_LABELS = {
     "otakume_onepiece":          "🏴\u200d☠️ Otakume (OP)",
     "legends_onepiece":          "🏴\u200d☠️ Legends (OP)",
     "amazon_onepiece":           "🏴\u200d☠️ Amazon (OP)",
+    "dabdoob":                   "🧸 Dabdoob",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -2052,6 +2057,259 @@ async def check_amazon_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
         log.error("Amazon One Piece check failed: %s", exc)
     return state
 
+
+# ─── DABDOOB ──────────────────────────────────────────────────────────────────
+#
+# dabdoob.com/en-AE is a Next.js app: search results are client-rendered and
+# the backend (api.primary.dabdoob.net) rejects unsigned calls ("Hash not right
+# (x-hash)"), so neither is scrape-able cheaply. Two things ARE plain HTTP:
+#   1. /_static_/sitemap/en-AE/products/  — ~30k product URLs, numeric ids
+#      ascending, so brand-new listings are detectable by diff (early signal).
+#   2. /en-AE/product/<slug>-<id>/        — server-rendered with a JSON-LD
+#      Product block: name, price, availability (InStock / OutOfStock).
+# Each pass diffs the sitemap for new Pokemon TCG URLs, then reads every
+# tracked TCG product page (~15) for price/stock. Cloudflare fronts the site
+# but does not challenge plain requests.
+
+DABDOOB_EXCLUDE = ("construx", "building", "figure", "plush", "pieces", "clip-n-go",
+                   "bandolier", "backpack", "back-pack", "lunch", "costume", "puzzle",
+                   "monopoly", "funko", "keychain", "squishmallow", "vinyl", "playset",
+                   "poke-ball-belt", "pencil", "stationery", "art-set", "briefcase",
+                   "bottle", "bag-", "-bag")
+DABDOOB_TCG_SUBSTR = ("tcg", "booster", "blister", "elite-trainer", "collection", "ex-box",
+                      "v-union", "vstar", "bundle", "sleeved", "trainer-box", "premium")
+# Bare "pack"/"box" matched pencil packs and backpacks; every real TCG slug is
+# already caught by a stronger token above, so only tin/deck remain here.
+DABDOOB_TCG_WORDS  = ("tin", "deck")
+DABDOOB_MAX_PAGES       = 30   # product pages per pass, safety cap
+DABDOOB_CONCURRENCY     = 3    # parallel product-page fetches
+DABDOOB_PAGE_TIMEOUT    = 15   # hard wall-clock cap per product page (s); healthy pages take ~2 s
+DABDOOB_PAGES_BUDGET    = 45   # hard wall-clock cap for the whole page phase (s)
+DABDOOB_SITEMAP_TIMEOUT = 60
+DABDOOB_MAX_BODY        = 1_500_000   # chars to read before giving up on JSON-LD
+_DABDOOB_LD_RE = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
+
+
+def _dabdoob_is_tcg(url: str) -> bool:
+    slug = url.rstrip("/").rsplit("/", 1)[-1].lower()
+    if "pokemon" not in slug:
+        return False
+    if any(x in slug for x in DABDOOB_EXCLUDE):
+        return False
+    if any(x in slug for x in DABDOOB_TCG_SUBSTR):
+        return True
+    words = set(slug.split("-"))
+    return any(w in words for w in DABDOOB_TCG_WORDS)
+
+
+def _dabdoob_pid(url: str) -> str:
+    m = re.search(r"-(\d+)/?$", url)
+    return m.group(1) if m else url
+
+
+def _dabdoob_product_ld(html: str) -> dict | None:
+    """First JSON-LD block whose @type is Product, or None."""
+    for m in _DABDOOB_LD_RE.finditer(html):
+        try:
+            d = json.loads(m.group(1))
+        except Exception:
+            continue
+        typ = d.get("@type")
+        if typ == "Product" or (isinstance(typ, list) and "Product" in typ):
+            return d
+    return None
+
+
+def _dabdoob_parse_product(html: str, url: str) -> dict | None:
+    """JSON-LD Product first; fall back to page text for stock."""
+    title = price = None; available = None
+    d = _dabdoob_product_ld(html)
+    if d:
+        title = d.get("name") or title
+        off = d.get("offers") or {}
+        if isinstance(off, list):
+            off = off[0] if off else {}
+        if off.get("price") is not None:
+            try:
+                price = f"AED {float(off['price']):.2f}"
+            except Exception:
+                price = f"AED {off['price']}"
+        av = str(off.get("availability") or "")
+        if av:
+            available = "InStock" in av or "LimitedAvailability" in av or "PreOrder" in av
+    if not title:
+        h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
+        title = re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else None
+    if available is None:
+        low = html.lower()
+        available = not ("out of stock" in low or "sold out" in low or "notify me" in low)
+    if not title:
+        return None
+    return {"title": title, "url": url, "price": price or "N/A", "available": bool(available)}
+
+
+async def _dabdoob_fetch_page(client: httpx.AsyncClient, url: str, hdr: dict) -> tuple[str, str | None]:
+    """Stream a product page and stop as soon as its Product JSON-LD has arrived.
+
+    Dabdoob's Next.js SSR streams the body and can hold the connection open
+    for many minutes after the useful part was sent (a live test saw 14 pages
+    take 85 min one pass and 80 s the next). A read-timeout never fires while
+    bytes trickle in, so the caller also wraps this in a wall-clock deadline.
+    Returns (status, html) with status one of ok / gone / http.
+    """
+    buf: list[str] = []
+    size = 0
+    # Sitemap URLs carry a trailing slash that 308-redirects to the bare
+    # path; fetch the bare path directly and save a round trip per page.
+    async with client.stream("GET", url.rstrip("/"), headers=hdr, timeout=DABDOOB_PAGE_TIMEOUT) as r:
+        if r.status_code in (404, 410):
+            return "gone", None
+        if r.status_code != 200:
+            return "http", None
+        async for chunk in r.aiter_text():
+            buf.append(chunk)
+            size += len(chunk)
+            html = "".join(buf)
+            if "ld+json" in html and _dabdoob_product_ld(html):
+                return "ok", html
+            if size >= DABDOOB_MAX_BODY:
+                return "ok", html
+    return "ok", "".join(buf)
+
+
+async def check_dabdoob(state: dict, client: httpx.AsyncClient) -> dict:
+    log.info("Checking Dabdoob...")
+    hdr = get_headers("https://dabdoob.com/en-AE")
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+
+        # ── 1. sitemap: which Pokemon TCG product URLs exist right now ────
+        r = await asyncio.wait_for(
+            client.get(URLS["dabdoob_sitemap"], headers=hdr, timeout=DABDOOB_SITEMAP_TIMEOUT),
+            DABDOOB_SITEMAP_TIMEOUT + 5,
+        )
+        if r.status_code != 200:
+            log.warning("Dabdoob: sitemap HTTP %s — skipping pass", r.status_code)
+            return state
+        all_urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text)
+        if len(all_urls) < 1000:
+            log.warning("Dabdoob: sitemap parsed only %d URLs — treating as failed", len(all_urls))
+            return state
+        tcg_urls = {_dabdoob_pid(u): u for u in all_urls if "/product/" in u and _dabdoob_is_tcg(u)}
+        log.info("Dabdoob: %d sitemap URLs, %d Pokemon TCG", len(all_urls), len(tcg_urls))
+        if not tcg_urls:
+            log.warning("Dabdoob: 0 TCG URLs matched — slug filter may need updating")
+            return state
+
+        prev = state.get("dabdoob") or {}
+        first_run = not prev
+        # A sitemap pid is a "new listing" candidate until its page has
+        # actually been read. That keeps two failure modes apart: a page that
+        # times out today still alerts when it finally loads, and a page that
+        # was never read during the baseline cannot masquerade as new later.
+        seen = set(state.get("dabdoob_seen") or [])
+        if not first_run and not seen:
+            seen = set(prev)                    # state written before dabdoob_seen existed
+        candidates = [pid for pid in tcg_urls if pid not in seen]
+
+        # ── 2. product pages: price + stock, bounded by wall-clock ────────
+        sem = asyncio.Semaphore(DABDOOB_CONCURRENCY)
+
+        async def _one(pid: str, url: str):
+            async with sem:
+                await asyncio.sleep(random.uniform(0.2, 0.9))
+                try:
+                    status, html = await asyncio.wait_for(
+                        _dabdoob_fetch_page(client, url, hdr), DABDOOB_PAGE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    return pid, "timeout", None
+                except Exception as exc:
+                    log.debug("Dabdoob: fetch %s failed: %s: %s", pid, type(exc).__name__, exc)
+                    return pid, "error", None
+                return pid, status, html
+
+        targets = list(tcg_urls.items())[:DABDOOB_MAX_PAGES]
+        tasks = [asyncio.create_task(_one(pid, url)) for pid, url in targets]
+        done, pending = await asyncio.wait(tasks, timeout=DABDOOB_PAGES_BUDGET)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        current: dict[str, dict] = {}
+        outcomes: dict[str, int] = {}
+        read = 0
+        for t in done:
+            pid, status, html = t.result()
+            if status != "ok":
+                outcomes[status] = outcomes.get(status, 0) + 1
+                continue
+            read += 1
+            seen.add(pid)                       # page read → no longer a candidate
+            info = _dabdoob_parse_product(html, tcg_urls[pid])
+            if not info or title_excluded(info["title"]) or not is_pokemon_title(info["title"]):
+                continue
+            current[pid] = info
+        if pending:
+            outcomes["over budget"] = len(pending)
+        problems = ", ".join(f"{v} {k}" for k, v in outcomes.items())
+
+        if not current:
+            log.warning("Dabdoob: no product pages parsed (%s) — skipping state update",
+                        problems or "no usable pages")
+            return state
+        log.info("Dabdoob: %d/%d product page(s) read%s, %d in stock", read, len(targets),
+                 f" ({problems})" if problems else "",
+                 sum(1 for v in current.values() if v["available"]))
+        mark_ok(state, "dabdoob")
+
+        # ── 3. alerts ─────────────────────────────────────────────────────
+        if first_run:
+            seen.update(tcg_urls)               # everything listed today is the baseline
+            in_stock = [v for v in current.values() if v["available"]]
+            lines = [f"<b>🧸 DABDOOB — Monitoring Started ({len(current)} Pokemon TCG products)</b>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                for v in in_stock[:20]:
+                    lines.append(fmt_product(v))
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("Dabdoob: baseline sent (%d products)", len(current))
+        else:
+            new_products = [current[p] for p in candidates if p in current]
+            restocked    = [v for p, v in current.items() if p in prev and v["available"] and not prev[p].get("available")]
+            went_oos     = [v for p, v in current.items() if p in prev and not v["available"] and prev[p].get("available")]
+            if new_products:
+                lines = [f"<b>🆕 DABDOOB — {len(new_products)} New Pokemon TCG Listing(s)!</b>",
+                         "<i>Spotted in the product sitemap.</i>"]
+                for v in new_products:
+                    lines.append(fmt_product(v))
+                await send_telegram("\n".join(lines), client)
+                log_events("dabdoob", "new", new_products)
+            if restocked:
+                lines = [f"<b>🟢 DABDOOB — {len(restocked)} Back In Stock!</b>"]
+                for v in restocked:
+                    lines.append(fmt_product(v, "✅"))
+                await send_telegram("\n".join(lines), client)
+                log_events("dabdoob", "restock", restocked)
+            if went_oos:
+                lines = ["<b>🔴 DABDOOB — Out of Stock</b>"]
+                for v in went_oos:
+                    lines.append(fmt_product(v, "❌"))
+                await send_telegram("\n".join(lines), client)
+            await alert_price_changes("dabdoob", "🧸 DABDOOB", prev, current, client)
+            if not (new_products or restocked or went_oos):
+                log.info("Dabdoob: no changes")
+
+        merged = dict(prev)
+        merged.update(current)
+        state["dabdoob"] = merged
+        state["dabdoob_seen"] = sorted(seen)
+    except Exception as exc:
+        log.error("Dabdoob check failed: %s: %s", type(exc).__name__, exc)
+    return state
 
 # ─── LEGENDS OWN THE GAME ─────────────────────────────────────────────────────
 
@@ -4263,6 +4521,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "pinca":                {"label": "🅿️ Pinca",                 "ok": None, "time": ""},
         "toybox":               {"label": "🧸 Toybox",                "ok": None, "time": ""},
         "amazon_onepiece":     {"label": "🏴‍☠️ Amazon (OP)",      "ok": None, "time": ""},
+        "dabdoob":              {"label": "🧸 Dabdoob",               "ok": None, "time": ""},
         "legends_onepiece":     {"label": "🏴‍☠️ Legends (OP)",      "ok": None, "time": ""},
         "otakume_onepiece":     {"label": "🏴‍☠️ Otakume (OP)",      "ok": None, "time": ""},
     }
@@ -4272,7 +4531,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece", "dabdoob"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -4330,7 +4589,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = last_onepiece = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = last_onepiece = last_dabdoob = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -4484,6 +4743,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "toybox" not in DISABLED_RETAILERS and now - last_toybox >= INTERVALS.get("toybox", 120):
                 headless_tasks.append(("toybox", check_toybox(state, client)))
                 last_toybox = now
+
+            if "dabdoob" not in DISABLED_RETAILERS and now - last_dabdoob >= INTERVALS.get("dabdoob", 600):
+                headless_tasks.append(("dabdoob", check_dabdoob(state, client)))
+                last_dabdoob = now
 
             if now - last_onepiece >= INTERVALS.get("onepiece", 180):
                 last_onepiece = now
@@ -4650,7 +4913,9 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
                         f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n"
                         f"🎴 Kinokuniya Event: every {INTERVALS.get('kinokuniya_event', 120) // 60} min\n"
-                        + (f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n\n"
+                        + (f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
+                        f"🏴‍☠️ One Piece (Otakume/Legends/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
+                        f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n\n"
                            if lorcana_active() else
                            f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): armed, activates {LORCANA_GO_LIVE:%H:%M UTC %d %b}\n\n")
                         + "Send <code>stop</code> to pause.",
