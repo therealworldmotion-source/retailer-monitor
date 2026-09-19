@@ -466,7 +466,10 @@ async def send_telegram(message: str, client: httpx.AsyncClient) -> int | None:
             else:
                 if first_id is None:
                     first_id = resp.json().get("result", {}).get("message_id")
-                log.info("Telegram message sent (%d chars)", len(chunk))
+                # Log the headline too — without it the logs only ever showed
+                # "(572 chars)" and which alert fired was unknowable afterwards.
+                head = re.sub(r"<[^>]+>", "", chunk.split("\n", 1)[0]).strip()[:90]
+                log.info("Telegram message sent (%d chars): %s", len(chunk), head)
             await asyncio.sleep(0.5)
         except Exception as exc:
             log.error("Telegram send failed: %s", exc)
@@ -4683,6 +4686,38 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                 lines.append("\nSend <code>stock</code> for the full in-stock list.")
                 await send_telegram("\n".join(lines), client)
 
+            elif text.split()[0] in ("recent", "events", "history") if text else False:
+                # Ground truth of what actually alerted: the append-only event log
+                # on the volume (new / restock / price_drop per retailer).
+                try:
+                    n = int(text.split()[1]) if len(text.split()) > 1 else 20
+                except ValueError:
+                    n = 20
+                n = max(1, min(n, 60))
+                try:
+                    tail = EVENTS_FILE.read_text().strip().split("\n")[-n:] if EVENTS_FILE.exists() else []
+                except Exception:
+                    tail = []
+                if not tail:
+                    await send_telegram("No events recorded yet.", client)
+                else:
+                    icons = {"new": "🆕", "restock": "🟢", "price_drop": "💰", "oos": "🔴"}
+                    lines = [f"<b>🕘 LAST {len(tail)} EVENT(S)</b>"]
+                    for raw in reversed(tail):
+                        try:
+                            ev = json.loads(raw)
+                        except Exception:
+                            continue
+                        ts = (ev.get("ts") or "")[:16].replace("T", " ")
+                        site = RETAILER_LABELS.get(ev.get("site", ""), ev.get("site", "?"))
+                        ic = icons.get(ev.get("kind"), "•")
+                        title = (ev.get("title") or "")[:60]
+                        price = ev.get("price") or ""
+                        url = ev.get("url") or ""
+                        item = f'<a href="{url}">{title}</a>' if url else title
+                        lines.append(f"{ic} <i>{ts}</i> {site}\n     {item} {price}")
+                    await send_telegram("\n".join(lines), client)
+
             elif text in ("stock", "instock", "in stock"):
                 # On-demand snapshot. Baselines no longer auto-resend on restart
                 # (they buried real alerts), so this is how you ask "what's in
@@ -4717,7 +4752,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                     "  <code>start</code>  — begin monitoring\n"
                     "  <code>stop</code>   — pause monitoring\n"
                     "  <code>status</code> — health of every retailer\n"
-                    "  <code>stock</code>  — everything in stock right now",
+                    "  <code>stock</code>  — everything in stock right now\n"
+                    "  <code>recent</code> — last 20 alerts that fired (recent 50 for more)",
                     client,
                 )
 
