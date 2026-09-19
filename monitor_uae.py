@@ -1864,9 +1864,19 @@ def _is_onepiece_product(title: str) -> bool:
 
 
 async def _onepiece_diff_and_alert(state: dict, client: httpx.AsyncClient,
-                                   state_key: str, headline: str, current: dict) -> None:
+                                   state_key: str, headline: str, current: dict,
+                                   merge: bool = False, max_new: int | None = None) -> None:
     """Shared baseline + new/restock/OOS alerting for the One Piece watchers.
-    Mirrors the Lorcana helper, including the armed-but-empty case."""
+    Mirrors the Lorcana helper, including the armed-but-empty case.
+
+    merge   — keep products that are missing from this pass in state. Needed for
+              sources whose result set is unstable (Amazon search): with plain
+              replace, a pass that loses page 2 to throttling erases page 2 from
+              memory and the next full pass re-announces all of it as "new"
+              (19 Sep 2026: 45 + 9 + 1 false "new" alerts in 35 min).
+    max_new — more "new" products than this in one pass is a reshuffle or a
+              recovered page, not a drop: absorb them silently.
+    """
     started_key = f"_{state_key}_started"
     prev = state.get(state_key, {})
 
@@ -1890,6 +1900,10 @@ async def _onepiece_diff_and_alert(state: dict, client: httpx.AsyncClient,
         new_products = [p for k, p in current.items() if k not in prev]
         restocked    = [p for k, p in current.items() if k in prev and p.get("available") and not prev[k].get("available")]
         went_oos     = [p for k, p in current.items() if k in prev and not p.get("available") and prev[k].get("available")]
+        if max_new is not None and len(new_products) > max_new:
+            log.warning("%s: %d 'new' products in one pass (cap %d) — absorbing silently",
+                        state_key, len(new_products), max_new)
+            new_products = []
         if new_products:
             lines = [f"<b>🆕 {headline} — {len(new_products)} New One Piece Product(s)!</b>"]
             for p in new_products:
@@ -1910,7 +1924,7 @@ async def _onepiece_diff_and_alert(state: dict, client: httpx.AsyncClient,
         await alert_price_changes(state_key, headline, prev, current, client)
         if not (new_products or restocked or went_oos):
             log.info("%s: no changes (%d products)", state_key, len(current))
-    state[state_key] = current
+    state[state_key] = {**prev, **current} if merge else current
 
 
 async def check_otakume_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
@@ -1994,6 +2008,9 @@ async def check_legends_onepiece(state: dict, client: httpx.AsyncClient) -> dict
     return state
 
 
+AMAZON_OP_MAX_NEW = 10   # real One Piece drops are a handful of listings, never dozens
+
+
 async def check_amazon_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
     """Amazon.ae — 'one piece card game' search. Shares Amazon's backoff window,
     since a block applies to the whole domain, not one query."""
@@ -2052,7 +2069,8 @@ async def check_amazon_onepiece(state: dict, client: httpx.AsyncClient) -> dict:
             log.warning("Amazon One Piece: no page fetched — skipping state update")
             return state
         mark_ok(state, "amazon_onepiece")
-        await _onepiece_diff_and_alert(state, client, "amazon_onepiece", "🏴‍☠️ AMAZON (OP)", current)
+        await _onepiece_diff_and_alert(state, client, "amazon_onepiece", "🏴‍☠️ AMAZON (OP)", current,
+                                       merge=True, max_new=AMAZON_OP_MAX_NEW)
     except Exception as exc:
         log.error("Amazon One Piece check failed: %s", exc)
     return state
@@ -4568,18 +4586,24 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # ── Error tracking — alert on repeated failures ──────────────────────────
     FAIL_COUNTS: dict[str, int] = {}      # consecutive failures per site
     FAIL_ALERTED: dict[str, bool] = {}    # whether we already sent an alert
+    # Amazon throttles Railway's IP on and off all day, so its FAILING pings were
+    # pure noise (7 in 5 h on 19 Sep 2026). Health still shows on the status board.
+    SILENT_FAIL_SITES = {"amazon_ae", "amazon_onepiece"}
 
     async def _track_failure(site: str, error_msg: str) -> None:
         FAIL_COUNTS[site] = FAIL_COUNTS.get(site, 0) + 1
         if FAIL_COUNTS[site] >= 3 and not FAIL_ALERTED.get(site):
-            await send_telegram(
-                f"⚠️ <b>{site.upper().replace('_', ' ')} — FAILING</b>\n\n"
-                f"Failed {FAIL_COUNTS[site]} checks in a row.\n"
-                f"Error: <code>{error_msg[:200]}</code>",
-                client,
-            )
+            if site in SILENT_FAIL_SITES:
+                log.warning("%s: %d consecutive failures (Telegram alert suppressed)", site, FAIL_COUNTS[site])
+            else:
+                await send_telegram(
+                    f"⚠️ <b>{site.upper().replace('_', ' ')} — FAILING</b>\n\n"
+                    f"Failed {FAIL_COUNTS[site]} checks in a row.\n"
+                    f"Error: <code>{error_msg[:200]}</code>",
+                    client,
+                )
+                log.warning("%s: alert sent after %d consecutive failures", site, FAIL_COUNTS[site])
             FAIL_ALERTED[site] = True
-            log.warning("%s: alert sent after %d consecutive failures", site, FAIL_COUNTS[site])
 
     def _track_success(site: str) -> None:
         if FAIL_COUNTS.get(site, 0) > 0:
