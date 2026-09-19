@@ -1435,6 +1435,10 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
 # anything anniversary-related. Alerts on NEW listings and restocks.
 
 AMAZON_IMPERSONATIONS = ("chrome120", "safari17_0")
+# Max seconds to wait between attempts after repeated failures. Override via
+# env AMAZON_BACKOFF_CAP (seconds). See the fail-streak comment in
+# check_amazon_ae for why 30 min rather than the original 4 h.
+AMAZON_BACKOFF_CAP = int(os.environ.get("AMAZON_BACKOFF_CAP", "1800"))
 
 AMAZON_TCG_HINTS = (
     "tcg", "elite trainer", "etb", "booster bundle", "booster box", "booster pack",
@@ -1575,17 +1579,21 @@ async def check_amazon_ae(state: dict, client: httpx.AsyncClient) -> dict:
                 await asyncio.sleep(random.uniform(8, 14))
 
         if not any_ok:
-            # Amazon blocks datacenter IPs outright (observed: 100% 503 from
-            # Railway while the same requests succeed from residential). Keep
-            # hammering and the block persists, so back off progressively:
-            # 10m -> 20m -> 40m -> 80m, capped at 4h, reset on first success.
+            # Amazon throttles Railway's IP INTERMITTENTLY, not permanently: two
+            # weeks of logs show ~65-80% of attempts succeed 12:00-15:00 GST and
+            # even overnight attempts succeed ~55-70% of the time. The old ladder
+            # (10m->20m->40m->80m->160m, capped at 4h) turned a single evening
+            # 503 into a 9-10 hour sleep, so "this morning it's dead" was mostly
+            # us not retrying: 169 of 335 monitored hours were spent in backoff.
+            # A failed attempt costs one fast 503, so probing every 30 min is
+            # cheap and catches the short reachable windows the 4h cap missed.
             fails = int(state.get("_amazon_fail_streak", 0)) + 1
             state["_amazon_fail_streak"] = fails
             base = INTERVALS.get("amazon_ae", 600)
-            backoff = min(base * (2 ** min(fails - 1, 5)), 14400)
+            backoff = min(base * (2 ** min(fails - 1, 5)), AMAZON_BACKOFF_CAP)
             state["_amazon_backoff_until"] = time.time() + backoff
             log.warning("Amazon.ae: no page fetched (fail streak %d) — backing off %d min "
-                        "(datacenter IP likely blocked)", fails, backoff // 60)
+                        "(intermittent throttle)", fails, backoff // 60)
             return state
         if not current:
             log.warning("Amazon.ae: 0 relevant products parsed — filters or layout may have changed")
