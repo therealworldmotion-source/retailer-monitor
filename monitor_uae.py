@@ -4275,26 +4275,32 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                     )
         else:
             new_products, restocked, went_oos = [], [], []
+            new_pids, restock_pids = [], []
             for pid, prod in current.items():
                 if pid not in prev:
-                    if prod["available"]:
-                        new_products.append(prod)
+                    if prod["available"] and _lt_cooldown_ok(state, pid):
+                        new_products.append(prod); new_pids.append(pid)
                 elif prod["available"] and not prev[pid]["available"]:
-                    restocked.append(prod)
+                    # cooldown: the 30th fast watcher may already have announced it
+                    if _lt_cooldown_ok(state, pid):
+                        restocked.append(prod); restock_pids.append(pid)
                 elif not prod["available"] and prev[pid]["available"]:
                     went_oos.append(prod)
 
             if new_products:
                 lines = [f"<b>🆕 LITTLE THINGS — {len(new_products)} New In-Stock Product(s)!</b>"]
                 for p in new_products:
-                    lines.append(fmt_product(p))
+                    lines.append(_lt_alert_line(p))
                 await send_telegram("\n".join(lines), client)
                 log_events("little_things", "new", new_products)
+                _lt_mark_alerted(state, new_pids)
             if restocked:
                 lines = [f"<b>🔥 LITTLE THINGS — {len(restocked)} Back In Stock!</b>"]
                 for p in restocked:
-                    lines.append(fmt_product(p, "✅"))
+                    lines.append(_lt_alert_line(p, "✅"))
                 await send_telegram("\n".join(lines), client)
+                log_events("little_things", "restock", restocked)
+                _lt_mark_alerted(state, restock_pids)
 
             # ── Auto-cart: build a Shopify cart permalink for watchlist hits ──
             auto_cfg = CFG.get("littlethings_auto_cart", {})
@@ -4332,6 +4338,145 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
         log.error("Little Things check failed: %s", exc)
 
     return state
+
+
+# ─── LITTLE THINGS — 30th ANNIVERSARY FAST WATCH + shared alert helpers ──────
+#
+# The seven English 30th Anniversary products went up 26 Sep 2026 behind the
+# Keypers members wall: product pages JS-redirect non-members to
+# /pages/subscribe-to-keypers and anonymous baskets reject them as sold out.
+# So every Little Things stock alert now carries a direct add-to-basket link
+# (/cart/add?id=VARIANT), which skips the product page entirely.
+#
+# check_lt_30th polls only the small pokemon-30th-anniversary collection, fast,
+# on the dedicated Little Things loop. The main Little Things checker also
+# tracks these products, so both share a per-product alert cooldown
+# (state["_lt_alerted"]) and a flip is announced once, by whichever sees it first.
+
+LT_30TH_URL       = "https://littlethingsme.com/collections/pokemon-30th-anniversary/products.json?limit=250"
+LT_30TH_INTERVAL  = 15     # seconds — one small request (the 7-product collection)
+# Pace of the dedicated Little Things loop. Before 28 Sep 2026 the "30 s" check
+# really ran every 47 s median (up to 141 s) and Little Things never returned a
+# 429/503 at that load (~5.5 req/min). A local test at a true 30 s + 15 s pace
+# (~13 req/min) drew two 503s in 3 min, so the main checker stays near its
+# proven pace — without the 2-minute gaps — and the fast watch backs off on any
+# push-back from the store.
+LT_MAIN_INTERVAL  = 45
+LT_OP_INTERVAL    = 60
+LT_ALERT_COOLDOWN = 300    # one stock alert per product per 5 min, across both watchers
+_LT30 = {"backoff_until": 0.0, "last_status": 200}
+
+
+def _lt_add_url(variant_id) -> str:
+    return f"https://littlethingsme.com/cart/add?id={variant_id}&amp;quantity=1"
+
+
+def _lt_alert_line(prod: dict, status_icon: str = "") -> str:
+    """fmt_product plus a one-tap add-to-basket link when the variant is known."""
+    line = fmt_product(prod, status_icon)
+    if prod.get("variant_id"):
+        line += f'\n     🛒 <a href="{_lt_add_url(prod["variant_id"])}">ADD TO BASKET</a>'
+    return line
+
+
+def _lt_cooldown_ok(state: dict, handle: str) -> bool:
+    last = (state.get("_lt_alerted") or {}).get(handle, 0)
+    return time.time() - float(last or 0) >= LT_ALERT_COOLDOWN
+
+
+def _lt_mark_alerted(state: dict, handles) -> None:
+    d = state.setdefault("_lt_alerted", {})
+    now = time.time()
+    for h in handles:
+        d[h] = now
+    for h in [h for h, t in d.items() if now - float(t or 0) > 86400]:
+        del d[h]
+
+
+async def check_lt_30th(state: dict, client: httpx.AsyncClient) -> tuple[dict, bool]:
+    """Fast watch on the Little Things 30th Anniversary collection.
+    Returns (state, changed) so the caller only writes state when needed."""
+    if time.time() < _LT30["backoff_until"]:
+        return state, False
+    try:
+        resp = await client.get(LT_30TH_URL, headers=get_json_headers(), timeout=15)
+    except Exception as exc:
+        log.warning("LT 30th: fetch failed: %s", exc)
+        return state, False
+    if resp.status_code != 200:
+        if resp.status_code == 429:
+            _LT30["backoff_until"] = time.time() + 120   # never let this watcher get the store IP-limited
+        elif resp.status_code >= 500:
+            _LT30["backoff_until"] = time.time() + 60    # store is struggling: ease off, the main checker still runs
+        if resp.status_code != _LT30["last_status"]:
+            log.warning("LT 30th: HTTP %s", resp.status_code)
+        _LT30["last_status"] = resp.status_code
+        return state, False
+    _LT30["last_status"] = 200
+    try:
+        products = json.loads(resp.content).get("products", [])
+    except Exception as exc:
+        log.warning("LT 30th: bad JSON: %s", exc)
+        return state, False
+
+    current: dict[str, dict] = {}
+    for p in products:
+        handle, title = p.get("handle", ""), p.get("title", "")
+        if not handle or not title or not is_pokemon_title(title) or title_excluded(title):
+            continue
+        variants = p.get("variants") or [{}]
+        avail_v = next((v for v in variants if v.get("available")), variants[0])
+        current[handle] = {
+            "title": title,
+            "url": f"https://littlethingsme.com/products/{handle}",
+            "price": f"AED {variants[0].get('price', '0')}",
+            "available": any(v.get("available") for v in variants),
+            "variant_id": avail_v.get("id") or variants[0].get("id"),
+        }
+
+    prev = state.get("lt_30th") or {}
+    if not prev:
+        state["lt_30th"] = current
+        log.info("LT 30th: watching %d product(s), %d in stock", len(current),
+                 sum(1 for v in current.values() if v["available"]))
+        return state, True
+
+    live = []   # (handle, product, is_new)
+    for h, prod in current.items():
+        if not prod["available"]:
+            continue
+        if h not in prev:
+            live.append((h, prod, True))
+        elif not prev[h].get("available"):
+            live.append((h, prod, False))
+    changed = any(h not in prev or prev[h].get("available") != v["available"] for h, v in current.items())
+    state["lt_30th"] = current
+
+    # Keep the main checker's view in step so it doesn't re-announce the flip.
+    main = state.get("little_things") or {}
+    for h, prod in current.items():
+        if h in main:
+            main[h]["available"] = prod["available"]
+            if prod.get("variant_id"):
+                main[h]["variant_id"] = prod["variant_id"]
+
+    to_alert = [(h, prod, is_new) for h, prod, is_new in live if _lt_cooldown_ok(state, h)]
+    if to_alert:
+        prods = [prod for _, prod, _ in to_alert]
+        lines = [f"<b>🚨🎉 LITTLE THINGS — 30th ANNIVERSARY LIVE ({len(prods)})!</b>", ""]
+        for _, prod, is_new in to_alert:
+            lines.append(_lt_alert_line(prod, "🆕" if is_new else "✅"))
+        vids = [prod["variant_id"] for prod in prods if prod.get("variant_id")]
+        if len(vids) > 1:
+            qs = "&amp;".join(f"items%5B%5D%5Bid%5D={v}&amp;items%5B%5D%5Bquantity%5D=1" for v in vids)
+            lines += ["", f'🛒🛒 <a href="https://littlethingsme.com/cart/add?{qs}">ADD ALL {len(vids)} TO BASKET</a>']
+        lines += ["", "⚡ Baskets don't hold stock. Check out straight away."]
+        await send_telegram("\n".join(lines), client)
+        _lt_mark_alerted(state, [h for h, _, _ in to_alert])
+        log_events("little_things", "restock", prods)
+        log.info("LT 30th: alerted %d product(s)", len(prods))
+        changed = True
+    return state, changed
 
 
 # ─── LITTLE THINGS ME — ONE PIECE (Shopify JSON) ─────────────────────────────
@@ -4569,11 +4714,18 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         lines.append(f"{icon} {gk['label']}{t}")
         return "\n".join(lines)
 
+    last_status_text = ""
+
     async def _push_status() -> None:
-        nonlocal status_msg_id
+        # Skip unchanged boards: every redundant edit counts toward Telegram's
+        # per-chat rate limit, and a 429 there would delay a real stock alert.
+        nonlocal status_msg_id, last_status_text
         text = _fmt_status()
         if status_msg_id:
-            await edit_telegram(status_msg_id, text, client)
+            if text == last_status_text:
+                return
+            if await edit_telegram(status_msg_id, text, client):
+                last_status_text = text
         else:
             status_msg_id = await send_telegram(text, client)
             state["status_msg_id"] = status_msg_id
@@ -4623,6 +4775,64 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # Post initial (all-pending) status board
     await _push_status()
 
+    # ── Little Things runs on its OWN loop ───────────────────────────────────
+    # It used to run at the top of this loop, which also awaits a gather of slow
+    # checks (Amazon, Dabdoob, browsers) and then sleeps 10 s, so the "every
+    # 30 s" check really ran every 47 s median and up to 141 s apart (28 Sep
+    # 2026, 7 h of logs). A drop can sell out in that gap. This loop is
+    # independent, so nothing else can delay it.
+    async def _little_things_loop() -> None:
+        nonlocal state
+        last_lt = last_lt_op = last_30th = last_push = 0.0
+        while True:
+            try:
+                ran = False
+                t = time.monotonic()
+                if "little_things" not in DISABLED_RETAILERS and t - last_lt >= LT_MAIN_INTERVAL:
+                    last_lt = t
+                    try:
+                        state = await check_little_things(state, client)
+                        _mark("little_things", bool(state.get("little_things")))
+                        _track_success("little_things")
+                    except Exception as exc:
+                        log.error("Little Things check failed: %s", exc)
+                        _mark("little_things", False)
+                        await _track_failure("little_things", str(exc))
+                    save_state(state)
+                    ran = True
+
+                t = time.monotonic()
+                if "little_things_onepiece" not in DISABLED_RETAILERS and t - last_lt_op >= LT_OP_INTERVAL:
+                    last_lt_op = t
+                    try:
+                        state = await check_little_things_onepiece(state, client)
+                        _mark("little_things_onepiece", bool(state.get("little_things_onepiece")))
+                        _track_success("little_things_onepiece")
+                    except Exception as exc:
+                        log.error("Little Things OP check failed: %s", exc)
+                        _mark("little_things_onepiece", False)
+                        await _track_failure("little_things_onepiece", str(exc))
+                    save_state(state)
+                    ran = True
+
+                if ran and time.monotonic() - last_push >= 60:
+                    last_push = time.monotonic()
+                    await _push_status()
+
+                t = time.monotonic()
+                if "lt_30th" not in DISABLED_RETAILERS and t - last_30th >= INTERVALS.get("lt_30th", LT_30TH_INTERVAL):
+                    last_30th = t
+                    state, changed = await check_lt_30th(state, client)
+                    if changed:
+                        save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Little Things loop error: %s", exc)
+            await asyncio.sleep(2)
+
+    lt_task = asyncio.create_task(_little_things_loop())
+
     try:
         while True:
             now = time.monotonic()
@@ -4660,33 +4870,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                         log.error("Browser relaunch failed: %s; will retry next rotation", exc2)
                         last_ctx_refresh = now
 
-            # ════ PRIORITY: LITTLE THINGS — runs first, every 30s ══════════
-            if "little_things" not in DISABLED_RETAILERS and now - last_little_things >= INTERVALS.get("little_things", 30):
-                try:
-                    state = await check_little_things(state, client)
-                    _mark("little_things", bool(state.get("little_things")))
-                    _track_success("little_things")
-                except Exception as exc:
-                    log.error("Little Things check failed: %s", exc)
-                    _mark("little_things", False)
-                    await _track_failure("little_things", str(exc))
-                save_state(state)
-                await _push_status()
-                last_little_things = now
-
-            # ════ PRIORITY: LITTLE THINGS ONE PIECE — runs first, every 30s ══
-            if "little_things_onepiece" not in DISABLED_RETAILERS and now - last_little_things_op >= INTERVALS.get("little_things", 30):
-                try:
-                    state = await check_little_things_onepiece(state, client)
-                    _mark("little_things_onepiece", bool(state.get("little_things_onepiece")))
-                    _track_success("little_things_onepiece")
-                except Exception as exc:
-                    log.error("Little Things OP check failed: %s", exc)
-                    _mark("little_things_onepiece", False)
-                    await _track_failure("little_things_onepiece", str(exc))
-                save_state(state)
-                await _push_status()
-                last_little_things_op = now
+            # Little Things (Pokemon, One Piece, 30th Anniversary) runs on its
+            # own loop — see _little_things_loop above.
 
             # ════ BATCH 1: HEADLESS / HTTP — run concurrently ════════════
             # These don't need a visible browser, safe to run in parallel
@@ -4849,6 +5034,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     except asyncio.CancelledError:
         log.info("Monitor loop cancelled")
     finally:
+        lt_task.cancel()
         try:
             await headless_context.close()
         except Exception:
