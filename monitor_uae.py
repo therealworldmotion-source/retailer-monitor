@@ -19,6 +19,7 @@ import random
 import re
 import time
 import unicodedata
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2864,148 +2865,252 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
 
 # ─── KINOKUNIYA UAE ───────────────────────────────────────────────────────────
 
+# ─── KINOKUNIYA (kinokuniya.ae — Shopify) ─────────────────────────────────────
+#
+# Late Sep 2026 Kinokuniya moved from uae.kinokuniya.com (custom site, /bw/
+# barcodes, /events pages) to kinokuniya.ae (Shopify, kinokuniya-ae.myshopify
+# .com). Every old URL now redirects to the new homepage, so the old checkers
+# read a page with 0 products — which they treated as the normal resting state
+# and so never flagged. Event pages don't exist on the new site.
+#
+# On the new site:
+#   • Cards are type "book", vendor "Books Kinokuniya UAE", inside the ~14k
+#     product toys-collectibles collection — no TCG collection/tag to filter on.
+#   • Pokemon TCG titles often omit "Pokemon": "Mega Evolutions (ME-05) Pitch
+#     Black Booster". Set names/codes must match too.
+#   • /search and /collections render server-side; titles come off the cards.
+# Each pass reads the newest toys-collectibles listings (catches a new product
+# under any name); every KINO_FULL_SEARCH_EVERY s it also walks a full keyword
+# search. Every tracked TCG product is then read from /products/<handle>.js
+# for stock, price and variant id.
+
+KINO_BASE              = "https://kinokuniya.ae"
+KINO_HDR               = {"Referer": "https://kinokuniya.ae/", "Accept-Language": "en-US,en;q=0.9"}
+KINO_SEARCH_TERMS      = ("tcg", "mega evolutions", "pokemon", "pokémon")
+KINO_SEARCH_MAX_PAGES  = 12
+KINO_NEWEST_URL        = KINO_BASE + "/collections/toys-collectibles?sort_by=created-descending"
+KINO_NEWEST_PAGES      = 2
+KINO_INTERVAL          = 60     # seconds, on its own loop (see monitor_loop)
+KINO_FULL_SEARCH_EVERY = 1800   # full walk takes ~60-90 s; new listings are caught every pass by the newest-first scan
+KINO_NEW_MAX_AGE_DAYS  = 7    # an older TCG listing first seen via search is a baseline gap, not news
+KINO_NOT_TCG = ("sticker", "handbook", "book", "guide", "how to draw", "colouring", "coloring", "annual",
+                "manga", "puzzle", "encyclopedia", "adventures", "vol.", "graphic novel", "reader",
+                "atlas", "trivia", "word games", "pop!", "funko", "mug", "plush", "figure", "capsule",
+                "pendant", "keychain", "charm", "t-shirt", "notebook", "calendar", "box set")
+KINO_TCG_HINTS = ("tcg", "trading card", "card game", "booster", "blister", "elite trainer", "etb",
+                  " tin", "tins", "deck", "premium collection", "collection box", "ex box", "bundle", "binder")
+_KINO_LINK_RE = re.compile(r"/products/([^?#/\"]+)")
+
+
+def _kino_is_pokemon_tcg(title: str) -> bool:
+    t = strip_accents(title)
+    if not t or title_excluded(title) or any(w in t for w in KINO_NOT_TCG):
+        return False
+    if re.search(r"mega evolutions?\b|\((?:me|sv|swsh)-?\d", t):
+        return True
+    return "pokemon" in t and any(h in t for h in KINO_TCG_HINTS)
+
+
+def _kino_parse_cards(page_html: str) -> list[tuple[str, str, bool]]:
+    """(handle, title, available) for each product card, in page order."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    out, seen = [], set()
+    for li in soup.select("li.product-item"):
+        a = li.select_one("a.product-item__title")
+        m = _KINO_LINK_RE.search(a.get("href", "")) if a else None
+        if not m or m.group(1) in seen:
+            continue
+        for lab in a.select(".product-item__image-wrapper"):
+            lab.decompose()                      # drops "Best Seller" style labels
+        title = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+        if not title:
+            continue
+        available = not re.search(r"sold out|out of stock", li.get_text(" ", strip=True), re.I)
+        seen.add(m.group(1))
+        out.append((m.group(1), title, available))
+    return out
+
+
+async def _kino_product(cf, handle: str):
+    """Product details from /products/<handle>.js; "gone" on 404, None on error."""
+    import html as _html
+    try:
+        r = await cf.get(f"{KINO_BASE}/products/{handle}.js", headers=KINO_HDR, timeout=20)
+    except Exception as exc:
+        log.debug("Kinokuniya: %s.js failed: %s", handle, exc)
+        return None
+    if r.status_code == 404:
+        return "gone"
+    if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
+        return None
+    try:
+        p = r.json()
+    except Exception:
+        return None
+    vs = p.get("variants") or [{}]
+    av = next((v for v in vs if v.get("available")), vs[0])
+    return {
+        "title":      _html.unescape(p.get("title") or ""),
+        "url":        f"{KINO_BASE}/products/{handle}",
+        "price":      f"AED {int(p.get('price') or 0) / 100:.2f}",
+        "available":  any(v.get("available") for v in vs),
+        "variant_id": av.get("id"),
+        "created_at": p.get("created_at") or "",
+    }
+
+
+def _kino_alert_line(prod: dict, status_icon: str = "") -> str:
+    line = fmt_product(prod, status_icon)
+    if prod.get("variant_id") and prod.get("available"):
+        line += (f'\n     🛒 <a href="{KINO_BASE}/cart/add?id={prod["variant_id"]}&amp;quantity=1">'
+                 f"ADD TO BASKET</a>")
+    return line
+
+
 async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
-    """Kinokuniya UAE — search results for 'pokemon tcg'.
-
-    AWS ELB + WAF: plain httpx returns 403, chrome impersonation gets blocked,
-    Safari impersonation + a homepage warmup GET works.
-
-    v1: tracks which products appear in the search results (by barcode in
-    /bw/{N} URLs). Alerts on new products only — search page doesn't expose
-    a stock indicator so we treat all results as 'in stock'. A per-product
-    stock fetch could be added later if Kinokuniya starts listing OOS items
-    in search."""
-    log.info("Checking Kinokuniya UAE...")
-
+    """Kinokuniya UAE on kinokuniya.ae — Pokemon TCG incl. Mega Evolutions sets."""
+    log.info("Checking Kinokuniya (kinokuniya.ae)...")
     try:
         from curl_cffi.requests import AsyncSession
     except ImportError as exc:
         log.error("curl_cffi not available: %s", exc)
         raise
 
-    current: dict[str, dict] = {}
+    started  = bool(state.get("_kino_ae_started"))
+    prev     = (state.get("kinokuniya") or {}) if started else {}   # old-site keys are meaningless now
+    now      = time.time()
+    full_due = (not started) or now - float(state.get("_kino_full_at", 0) or 0) >= KINO_FULL_SEARCH_EVERY
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-
-        # Search both the plain and accented spellings — Kinokuniya's search
-        # is accent-sensitive, so "pokemon" and "Pokémon" surface different
-        # hits. Merge results by barcode (dedup handles overlap).
-        search_urls = [URLS["kinokuniya"], URLS.get("kinokuniya_accented")]
-        search_urls = [u for u in search_urls if u]
-
-        any_ok = False
         async with AsyncSession(impersonate="safari17_0") as cf:
-            # Warm up — AWS WAF cookies get set on first visit
-            try:
-                await cf.get("https://uae.kinokuniya.com/", timeout=15)
-            except Exception:
-                pass
+            async def cards(url: str):
+                try:
+                    r = await cf.get(url, headers=KINO_HDR, timeout=30)
+                except Exception as exc:
+                    log.warning("Kinokuniya: %s for %s", type(exc).__name__, url)
+                    return None
+                if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
+                    log.warning("Kinokuniya: HTTP %s for %s", r.status_code, url)
+                    return None
+                return _kino_parse_cards(r.text)
 
-            for su in search_urls:
-              # Paginate — the 'tcg' search runs to ~5 pages and a Pokemon item
-              # can sit on any of them.
-              for page_num in range(1, 9):
-                page_url = su if page_num == 1 else f"{su}&page={page_num}"
-                resp = await cf.get(
-                    page_url,
-                    headers={
-                        "Referer": "https://uae.kinokuniya.com/",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                    timeout=25,
-                )
-                if resp.status_code != 200:
-                    log.warning("Kinokuniya: HTTP %s for %s", resp.status_code, page_url)
+            found: dict[str, str] = {}          # handle -> title (Pokemon TCG only)
+            newest: set[str] = set()
+            newest_ok = False
+            for pg in range(1, KINO_NEWEST_PAGES + 1):
+                cs = await cards(f"{KINO_NEWEST_URL}&page={pg}")
+                if cs is None:
                     break
-                any_ok = True
+                newest_ok = True
+                for h, t, _a in cs:
+                    newest.add(h)
+                    if _kino_is_pokemon_tcg(t):
+                        found[h] = t
+                await asyncio.sleep(random.uniform(0.8, 1.6))
 
-                soup  = BeautifulSoup(resp.text, "html.parser")
-                boxes = soup.select("div#image_or_detail div.box")
-                log.info("Kinokuniya: %d product card(s) for %s page %d",
-                         len(boxes), su.split("keywords=")[-1], page_num)
-                if not boxes:
-                    break
+            search_ok = False
+            if full_due:
+                search_ok = True
+                for term in KINO_SEARCH_TERMS:
+                    term_ok = False
+                    for pg in range(1, KINO_SEARCH_MAX_PAGES + 1):
+                        cs = await cards(f"{KINO_BASE}/search?q={urllib.parse.quote_plus(term)}&type=product&page={pg}")
+                        if cs is None:
+                            break
+                        term_ok = True
+                        if not cs:
+                            break
+                        for h, t, _a in cs:
+                            if _kino_is_pokemon_tcg(t):
+                                found[h] = t
+                        await asyncio.sleep(random.uniform(0.4, 0.9))
+                    search_ok = search_ok and term_ok
+                if search_ok:
+                    state["_kino_full_at"] = now
 
-                for box in boxes:
-                    link = box.select_one("a[href*='/bw/']")
-                    if not link:
-                        continue
-                    href = link.get("href", "")
-                    m = re.search(r"/bw/(\d+)", href)
-                    if not m:
-                        continue
-                    barcode = m.group(1)
+            # A partial baseline would re-announce everything it missed later.
+            if not started and not (newest_ok and search_ok):
+                log.warning("Kinokuniya: baseline needs every page — retrying next pass")
+                return state
+            if not newest_ok and not search_ok:
+                log.warning("Kinokuniya: all pages failed — skipping pass")
+                return state
 
-                    title_el = box.select_one("span.title")
-                    title = title_el.get_text(strip=True) if title_el else ""
-                    if not title or len(title) < 3:
-                        continue
-                    if title_excluded(title):
-                        continue
-
-                    price_el = box.select_one(f"span#search_product_image_online_price_{barcode}")
-                    price = price_el.get_text(strip=True) if price_el else "N/A"
-
-                    prod_url = href if href.startswith("http") else f"https://uae.kinokuniya.com{href}"
-
-                    # The 'tcg' search returns every TCG brand (Yu-Gi-Oh, Digimon...),
-                    # so keep only Pokemon here.
-                    if not is_pokemon_title(title):
-                        continue
-
-                    current[barcode] = {
-                        "title":     title,
-                        "url":       prod_url,
-                        "price":     price,
-                        "available": True,  # search hits treated as available; no stock indicator on listing page
-                    }
-                await asyncio.sleep(random.uniform(1, 2))
-
-        if not any_ok:
-            log.warning("Kinokuniya: all searches failed — skipping state update")
-            return state
-        # Kinokuniya only carries Pokemon TCG on launch day, then it sells out
-        # and delists — so 0 products is the normal resting state, NOT a fault.
-        # Mark healthy (no false FAILING alerts) and keep state empty so the
-        # next launch alerts as new products.
-        if not current:
-            log.info("Kinokuniya: fetched OK, 0 Pokemon TCG products (normal between launches)")
-            mark_ok(state, "kinokuniya")
-            state["kinokuniya"] = {}
-            return state
-
-        log.info("Kinokuniya: %d unique product(s) across %d search term(s)", len(current), len(search_urls))
+            current: dict[str, dict] = {}
+            for h in dict.fromkeys(list(prev) + list(found)):
+                info = await _kino_product(cf, h)
+                if info == "gone":
+                    continue
+                if info is None:
+                    if h in prev:
+                        current[h] = prev[h]            # transient error: keep what we knew
+                    continue
+                current[h] = info
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
         mark_ok(state, "kinokuniya")
+        log.info("Kinokuniya: %d Pokemon TCG product(s), %d in stock%s", len(current),
+                 sum(1 for v in current.values() if v["available"]), " (full search)" if full_due else "")
 
-        prev      = state.get("kinokuniya", {})
-        first_run = len(prev) == 0
-
-        if first_run:
-            lines = [f"<b>📚 KINOKUNIYA UAE — Monitoring Started ({len(current)} product{'s' if len(current)!=1 else ''})</b>"]
-            for p in current.values():
-                lines.append(fmt_product(p))
+        if not started:
+            in_stock = [v for v in current.values() if v["available"]]
+            lines = [f"<b>📚 KINOKUNIYA — now watching kinokuniya.ae ({len(current)} Pokemon TCG product{'s' if len(current) != 1 else ''})</b>",
+                     "<i>Kinokuniya moved to a new website; the old one redirects to it.</i>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                lines += [_kino_alert_line(v) for v in in_stock[:20]]
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
             await send_telegram("\n".join(lines), client)
-            log.info("Kinokuniya: baseline sent (%d products)", len(current))
+            state["_kino_ae_started"] = True
+            log.info("Kinokuniya: kinokuniya.ae baseline sent (%d products)", len(current))
         else:
-            new_products = [p for bid, p in current.items() if bid not in prev]
+            new_products, restocked, went_oos = [], [], []
+            for h, v in current.items():
+                if h not in prev:
+                    fresh = True
+                    if h not in newest and v.get("created_at"):
+                        try:
+                            age = datetime.now(timezone.utc) - datetime.fromisoformat(v["created_at"])
+                            fresh = age.days <= KINO_NEW_MAX_AGE_DAYS
+                        except Exception:
+                            pass
+                    if fresh:
+                        new_products.append(v)
+                    else:
+                        log.info("Kinokuniya: absorbing older listing first seen now: %s", v["title"])
+                elif v["available"] and not prev[h].get("available"):
+                    restocked.append(v)
+                elif not v["available"] and prev[h].get("available"):
+                    went_oos.append(v)
             if new_products:
-                lines = [f"<b>🆕 KINOKUNIYA UAE — {len(new_products)} New Product(s)!</b>"]
-                for p in new_products:
-                    lines.append(fmt_product(p))
+                lines = [f"<b>🆕 KINOKUNIYA — {len(new_products)} New Pokemon TCG Listing(s)!</b>"]
+                lines += [_kino_alert_line(v) for v in new_products]
                 await send_telegram("\n".join(lines), client)
-            else:
-                log.info("Kinokuniya: no new products")
+                log_events("kinokuniya", "new", new_products)
+            if restocked:
+                lines = [f"<b>🟢 KINOKUNIYA — {len(restocked)} Back In Stock!</b>"]
+                lines += [_kino_alert_line(v, "✅") for v in restocked]
+                await send_telegram("\n".join(lines), client)
+                log_events("kinokuniya", "restock", restocked)
+            if went_oos:
+                log.info("Kinokuniya: %d went out of stock", len(went_oos))
+            await alert_price_changes("kinokuniya", "📚 KINOKUNIYA", prev, current, client)
+            if not (new_products or restocked):
+                log.info("Kinokuniya: no changes")
 
         state["kinokuniya"] = current
-
     except Exception as exc:
-        log.error("Kinokuniya check failed: %s", exc)
-
+        log.error("Kinokuniya check failed: %s: %s", type(exc).__name__, exc)
     return state
 
 
+# ── RETIRED (Sep 2026): uae.kinokuniya.com event pages. The site moved to
+# kinokuniya.ae, which has no /events pages; the event checker and discovery
+# below are no longer scheduled. New listings are caught by check_kinokuniya's
+# newest-listings scan instead.
 # Pinned Kinokuniya event page(s). 1243 (Pitch Black) stays pinned even after it
 # drains, so a restock on it is still caught. Override/extend via env:
 #   KINOKUNIYA_EVENT_URLS="https://uae.kinokuniya.com/events/1243,https://.../events/1300"
@@ -3330,6 +3435,7 @@ async def _lorcana_diff_and_alert(state: dict, client: httpx.AsyncClient,
 
 
 async def check_kinokuniya_lorcana(state: dict, client: httpx.AsyncClient) -> dict:
+    """Lorcana on kinokuniya.ae (search 'lorcana'; availability from the card)."""
     if not lorcana_active():
         return state
     log.info("Checking Kinokuniya (Lorcana)...")
@@ -3337,35 +3443,32 @@ async def check_kinokuniya_lorcana(state: dict, client: httpx.AsyncClient) -> di
         from curl_cffi.requests import AsyncSession
     except ImportError as exc:
         log.error("curl_cffi not available: %s", exc); raise
+    # Old-site state (barcodes from /bw/ links, emptied while the old site
+    # redirected) must not make every new-site product look "new": re-baseline once.
+    if not state.get("_kino_ae_lorcana_migrated"):
+        state.pop("_kinokuniya_lorcana_started", None)
+        state["kinokuniya_lorcana"] = {}
+        state["_kino_ae_lorcana_migrated"] = True
     current: dict[str, dict] = {}
     try:
         await asyncio.sleep(random.uniform(1, 3))
+        ok = False
         async with AsyncSession(impersonate="safari17_0") as cf:
-            try:
-                await cf.get("https://uae.kinokuniya.com/", timeout=15)
-            except Exception:
-                pass
-            resp = await cf.get(URLS["kinokuniya_lorcana"],
-                                headers={"Referer": "https://uae.kinokuniya.com/", "Accept-Language": "en-US,en;q=0.9"},
-                                timeout=25)
-        if resp.status_code != 200:
-            log.warning("Kinokuniya Lorcana: HTTP %s", resp.status_code); return state
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for box in soup.select("div#image_or_detail div.box"):
-            link = box.select_one("a[href*='/bw/']")
-            if not link:
-                continue
-            m = re.search(r"/bw/(\d+)", link.get("href", ""))
-            if not m:
-                continue
-            bc = m.group(1)
-            te = box.select_one("span.title")
-            title = te.get_text(strip=True) if te else ""
-            if not _is_lorcana_product(title):
-                continue
-            pe = box.select_one(f"span#search_product_image_online_price_{bc}")
-            price = pe.get_text(strip=True) if pe else "N/A"
-            current[bc] = {"title": title, "url": f"https://uae.kinokuniya.com/bw/{bc}", "price": price, "available": True}
+            for pg in range(1, 6):
+                r = await cf.get(f"{KINO_BASE}/search?q=lorcana&type=product&page={pg}", headers=KINO_HDR, timeout=30)
+                if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
+                    log.warning("Kinokuniya Lorcana: HTTP %s", r.status_code)
+                    break
+                ok = True
+                cs = _kino_parse_cards(r.text)
+                if not cs:
+                    break
+                for h, t, avail in cs:
+                    if _is_lorcana_product(t):
+                        current[h] = {"title": t, "url": f"{KINO_BASE}/products/{h}", "price": "N/A", "available": avail}
+                await asyncio.sleep(random.uniform(0.8, 1.6))
+        if not ok:
+            return state
         await _lorcana_diff_and_alert(state, client, "kinokuniya_lorcana", "🃏 KINOKUNIYA (LORCANA)", current)
     except Exception as exc:
         log.error("Kinokuniya Lorcana check failed: %s", exc)
@@ -4676,7 +4779,6 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "little_things_onepiece": {"label": "🏴‍☠️ Little Things (OP)", "ok": None, "time": ""},
         "toycorner":            {"label": "🧸 Toy Corner",            "ok": None, "time": ""},
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
-        "kinokuniya_event":     {"label": "🎴 Kinokuniya Event",      "ok": None, "time": ""},
         "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
         "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
         "littlethings_backend": {"label": "🗺️ Little Things Backend", "ok": None, "time": ""},
@@ -4694,7 +4796,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "kinokuniya_event", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece", "dabdoob"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece", "dabdoob"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -4833,6 +4935,31 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     lt_task = asyncio.create_task(_little_things_loop())
 
+    # ── Kinokuniya runs on its OWN loop too, every 60 s ───────────────────────
+    # In the shared gather a 60 s interval would really be 50-140 s, and its
+    # half-hourly full search (~60-90 s) would hold every other retailer up.
+    async def _kinokuniya_loop() -> None:
+        nonlocal state
+        while True:
+            t0 = time.monotonic()
+            try:
+                if "kinokuniya" not in DISABLED_RETAILERS:
+                    state = await check_kinokuniya(state, client)
+                    ok = not check_is_stale(state, "kinokuniya", KINO_INTERVAL)
+                    _mark("kinokuniya", ok)
+                    if ok:
+                        _track_success("kinokuniya")
+                    else:
+                        await _track_failure("kinokuniya", "check completed but returned no usable data (site may be blind)")
+                    save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Kinokuniya loop error: %s", exc)
+            await asyncio.sleep(max(5.0, KINO_INTERVAL - (time.monotonic() - t0)))
+
+    kino_task = asyncio.create_task(_kinokuniya_loop())
+
     try:
         while True:
             now = time.monotonic()
@@ -4910,24 +5037,9 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 headless_tasks.append(("toycorner", check_toycorner(state, client)))
                 last_toycorner = now
 
-            if "kinokuniya" not in DISABLED_RETAILERS and now - last_kinokuniya >= INTERVALS.get("kinokuniya", 120):
-                headless_tasks.append(("kinokuniya", check_kinokuniya(state, client)))
-                last_kinokuniya = now
+            # Kinokuniya runs on its own 60 s loop — see _kinokuniya_loop above.
 
-            if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kinokuniya_event >= INTERVALS.get("kinokuniya_event", 120):
-                headless_tasks.append(("kinokuniya_event", check_kinokuniya_event(state, client)))
-                last_kinokuniya_event = now
-
-            # Auto-discovery of brand-new Pokemon event pages runs on a much
-            # slower timer (it opens each unclassified event once to read its
-            # real title). Runs inline so it can't race the event checker.
-            if "kinokuniya_event" not in DISABLED_RETAILERS and now - last_kino_discovery >= KINO_DISCOVERY_INTERVAL:
-                last_kino_discovery = now
-                try:
-                    state = await discover_kinokuniya_events(state, client)
-                    save_state(state)
-                except Exception as exc:
-                    log.error("Kinokuniya discovery error: %s", exc)
+            # Kinokuniya event pages retired (site moved to kinokuniya.ae).
 
             if "elctoys" not in DISABLED_RETAILERS and now - last_elctoys >= INTERVALS.get("elctoys", 120):
                 headless_tasks.append(("elctoys", check_elctoys(state, client)))
@@ -5035,6 +5147,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         log.info("Monitor loop cancelled")
     finally:
         lt_task.cancel()
+        kino_task.cancel()
         try:
             await headless_context.close()
         except Exception:
@@ -5121,8 +5234,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
-                        f"📚 Kinokuniya: every {INTERVALS.get('kinokuniya', 120) // 60} min\n"
-                        f"🎴 Kinokuniya Event: every {INTERVALS.get('kinokuniya_event', 120) // 60} min\n"
+                        f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL // 60} min\n"
                         + (f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
                         f"🏴‍☠️ One Piece (Otakume/Legends/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
                         f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n\n"
