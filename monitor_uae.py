@@ -56,10 +56,15 @@ DATA_DIR    = Path(os.environ.get("DATA_DIR", "."))
 CONFIG_FILE = Path("config_uae.json")
 STATE_FILE  = DATA_DIR / "state_uae.json"
 
+# Retailers switched off in code (the user's call). 29 Sep 2026: Gurps dropped
+# Legends Own The Game entirely: Pokemon, One Piece and Lorcana. The checkers
+# stay in the file; remove a key here to bring one back.
+ALWAYS_DISABLED = {"legends_own_the_game", "legends_onepiece", "legends_lorcana"}
+
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
 DISABLED_RETAILERS = {
     s.strip().lower() for s in os.environ.get("DISABLED_RETAILERS", "").split(",") if s.strip()
-}
+} | ALWAYS_DISABLED
 
 # ─── LORCANA GO-LIVE GATE ─────────────────────────────────────────────────────
 # The Lorcana watchers stay dormant until this moment, then switch on
@@ -4804,7 +4809,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         lines = ["<b>📊 UAE Monitor Status</b>"]
         lines.append("\n<b>⚡ Every 1 min (headless)</b>")
         for k, v in CHECK_STATUS.items():
-            if k in HEADLESS_SITES:
+            if k in HEADLESS_SITES and k not in DISABLED_RETAILERS:
                 icon = "✅" if v["ok"] is True else ("❌" if v["ok"] is False else "⏳")
                 t    = f" <i>({v['time']})</i>" if v["time"] else ""
                 lines.append(f"{icon} {v['label']}{t}")
@@ -5227,7 +5232,6 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         "✅ <b>UAE Retailer Monitor started!</b>\n\n"
                         f"🟡 Otakume: every {INTERVALS['otakume'] // 60} min\n"
                         f"🇦🇪 Virgin Megastore: every {INTERVALS['virgin_megastore'] // 60} min\n"
-                        f"🎴 Legends Own The Game: every {INTERVALS['legends_own_the_game'] // 60} min\n"
                         f"🧩 Colorland Toys: every {INTERVALS['colorland_toys'] // 60} min\n"
                         f"📚 Magrudy: every {INTERVALS['magrudy'] // 60} min\n"
                         f"🕹️ ZGames: every {INTERVALS['zgames'] // 60} min\n"
@@ -5235,8 +5239,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
                         f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL // 60} min\n"
-                        + (f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
-                        f"🏴‍☠️ One Piece (Otakume/Legends/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
+                        + (f"🃏 Lorcana ({sum(1 for c in LORCANA_CHECKS if c[0] not in DISABLED_RETAILERS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
+                        f"🏴‍☠️ One Piece (Otakume/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
                         f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n\n"
                            if lorcana_active() else
                            f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): armed, activates {LORCANA_GO_LIVE:%H:%M UTC %d %b}\n\n")
