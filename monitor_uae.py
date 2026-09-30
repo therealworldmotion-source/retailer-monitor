@@ -2884,17 +2884,22 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
 #   • Pokemon TCG titles often omit "Pokemon": "Mega Evolutions (ME-05) Pitch
 #     Black Booster". Set names/codes must match too.
 #   • /search and /collections render server-side; titles come off the cards.
-# Each pass reads the newest toys-collectibles listings (catches a new product
-# under any name); every KINO_FULL_SEARCH_EVERY s it also walks a full keyword
-# search. Every tracked TCG product is then read from /products/<handle>.js
-# for stock, price and variant id.
+# Each pass reads the 50 most recently published products store-wide from
+# /products.json (JSON; the HTML collection page got 403-blocked from Railway),
+# so a new listing is caught under any name; every KINO_FULL_SEARCH_EVERY s it
+# also walks a full keyword search. Tracked TCG products not in the feed are
+# read from /products/<handle>.js for stock, price and variant id.
 
 KINO_BASE              = "https://kinokuniya.ae"
 KINO_HDR               = {"Referer": "https://kinokuniya.ae/", "Accept-Language": "en-US,en;q=0.9"}
 KINO_SEARCH_TERMS      = ("tcg", "mega evolutions", "pokemon", "pokémon")
 KINO_SEARCH_MAX_PAGES  = 12
-KINO_NEWEST_URL        = KINO_BASE + "/collections/toys-collectibles?sort_by=created-descending"
-KINO_NEWEST_PAGES      = 2
+# Newest-published products across the whole store, as JSON. /products.json is
+# sorted by published_at descending, so a newly published TCG product is at the
+# top. Replaced the newest-first toys-collectibles HTML page on 30 Sep 2026:
+# polled once a minute from Railway, that page drew HTTP 403 from about an hour
+# after go-live and ~96% of the time after that; the JSON feed is not blocked.
+KINO_FEED_URL          = KINO_BASE + "/products.json?limit=50"
 KINO_INTERVAL          = 60     # seconds, on its own loop (see monitor_loop)
 KINO_FULL_SEARCH_EVERY = 1800   # full walk takes ~60-90 s; new listings are caught every pass by the newest-first scan
 KINO_NEW_MAX_AGE_DAYS  = 7    # an older TCG listing first seen via search is a baseline gap, not news
@@ -2959,8 +2964,28 @@ async def _kino_product(cf, handle: str):
         "url":        f"{KINO_BASE}/products/{handle}",
         "price":      f"AED {int(p.get('price') or 0) / 100:.2f}",
         "available":  any(v.get("available") for v in vs),
-        "variant_id": av.get("id"),
-        "created_at": p.get("created_at") or "",
+        "variant_id":   av.get("id"),
+        "created_at":   p.get("created_at") or "",
+        "published_at": p.get("published_at") or "",
+    }
+
+
+def _kino_from_feed(fp: dict) -> dict:
+    """Same shape as _kino_product, from a /products.json entry."""
+    vs = fp.get("variants") or [{}]
+    av = next((v for v in vs if v.get("available")), vs[0])
+    try:
+        price = f"AED {float(vs[0].get('price') or 0):.2f}"
+    except Exception:
+        price = "N/A"
+    return {
+        "title":        fp.get("title") or "",
+        "url":          f"{KINO_BASE}/products/{fp.get('handle')}",
+        "price":        price,
+        "available":    any(v.get("available") for v in vs),
+        "variant_id":   av.get("id"),
+        "created_at":   fp.get("created_at") or "",
+        "published_at": fp.get("published_at") or "",
     }
 
 
@@ -3001,18 +3026,25 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                 return _kino_parse_cards(r.text)
 
             found: dict[str, str] = {}          # handle -> title (Pokemon TCG only)
-            newest: set[str] = set()
+            newest: set[str] = set()             # handles in the newest-published feed
+            feed: dict[str, dict] = {}           # full details for TCG products in the feed
             newest_ok = False
-            for pg in range(1, KINO_NEWEST_PAGES + 1):
-                cs = await cards(f"{KINO_NEWEST_URL}&page={pg}")
-                if cs is None:
-                    break
-                newest_ok = True
-                for h, t, _a in cs:
-                    newest.add(h)
-                    if _kino_is_pokemon_tcg(t):
-                        found[h] = t
-                await asyncio.sleep(random.uniform(0.8, 1.6))
+            try:
+                r = await cf.get(KINO_FEED_URL, headers=KINO_HDR, timeout=30)
+                if r.status_code == 200 and "kinokuniya.ae" in str(r.url):
+                    for fp in r.json().get("products", []):
+                        h, t = fp.get("handle"), fp.get("title") or ""
+                        if not h:
+                            continue
+                        newest.add(h)
+                        if _kino_is_pokemon_tcg(t):
+                            found[h] = t
+                            feed[h] = _kino_from_feed(fp)
+                    newest_ok = True
+                else:
+                    log.warning("Kinokuniya: HTTP %s for the products feed", r.status_code)
+            except Exception as exc:
+                log.warning("Kinokuniya: products feed failed: %s: %s", type(exc).__name__, exc)
 
             search_ok = False
             if full_due:
@@ -3044,6 +3076,9 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
 
             current: dict[str, dict] = {}
             for h in dict.fromkeys(list(prev) + list(found)):
+                if h in feed:
+                    current[h] = feed[h]
+                    continue
                 info = await _kino_product(cf, h)
                 if info == "gone":
                     continue
@@ -3076,9 +3111,10 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
             for h, v in current.items():
                 if h not in prev:
                     fresh = True
-                    if h not in newest and v.get("created_at"):
+                    stamp = v.get("published_at") or v.get("created_at")
+                    if h not in newest and stamp:
                         try:
-                            age = datetime.now(timezone.utc) - datetime.fromisoformat(v["created_at"])
+                            age = datetime.now(timezone.utc) - datetime.fromisoformat(stamp)
                             fresh = age.days <= KINO_NEW_MAX_AGE_DAYS
                         except Exception:
                             pass
