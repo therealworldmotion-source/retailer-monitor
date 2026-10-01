@@ -2892,7 +2892,7 @@ async def check_toycorner(state: dict, client: httpx.AsyncClient) -> dict:
 
 KINO_BASE              = "https://kinokuniya.ae"
 KINO_HDR               = {"Referer": "https://kinokuniya.ae/", "Accept-Language": "en-US,en;q=0.9"}
-KINO_SEARCH_TERMS      = ("tcg", "mega evolutions", "pokemon", "pokémon")
+KINO_SEARCH_TERMS      = ("tcg", "mega evolutions", "pokemon", "pokémon", "30th anniversary")
 KINO_SEARCH_MAX_PAGES  = 12
 # Newest-published products across the whole store, as JSON. /products.json is
 # sorted by published_at descending, so a newly published TCG product is at the
@@ -2913,8 +2913,10 @@ KINO_NOT_TCG = ("sticker", "handbook", "book", "guide", "how to draw", "colourin
                 "manga", "puzzle", "encyclopedia", "adventures", "vol.", "graphic novel", "reader",
                 "atlas", "trivia", "word games", "pop!", "funko", "mug", "plush", "figure", "capsule",
                 "pendant", "keychain", "charm", "t-shirt", "notebook", "calendar", "box set")
-KINO_TCG_HINTS = ("tcg", "trading card", "card game", "booster", "blister", "elite trainer", "etb",
-                  " tin", "tins", "deck", "premium collection", "collection box", "ex box", "bundle", "binder")
+KINO_TCG_HINTS = ("tcg", "trading card", "card game", "booster", "blister", "elite trainer",
+                  "premium collection", "collection box", "ex box", "bundle", "binder",
+                  "poster collection", "special collection")
+_KINO_TCG_WORDS = re.compile(r"\b(?:tins?|decks?|etb|upc)\b")     # whole words: "tin" must not match "Tina"/"Tintin"
 _KINO_LINK_RE = re.compile(r"/products/([^?#/\"]+)")
 
 
@@ -2924,7 +2926,17 @@ def _kino_is_pokemon_tcg(title: str) -> bool:
         return False
     if re.search(r"mega evolutions?\b|\((?:me|sv|swsh)-?\d", t):
         return True
-    return "pokemon" in t and any(h in t for h in KINO_TCG_HINTS)
+    tcg_shaped = any(h in t for h in KINO_TCG_HINTS) or bool(_KINO_TCG_WORDS.search(t))
+    # 30th Anniversary is the priority line and Kinokuniya drops "Pokemon" from
+    # card titles, so "30th Anniversary Elite Trainer Box" must match on its own.
+    # Books ("... 30th Anniversary Edition") have no card-product word and stay out.
+    if "30th" in t and tcg_shaped:
+        return True
+    return "pokemon" in t and tcg_shaped
+
+
+def _kino_is_30th(prods) -> bool:
+    return any("30th" in strip_accents(v.get("title", "")) for v in prods)
 
 
 def _kino_parse_cards(page_html: str) -> list[tuple[str, str, bool]]:
@@ -3149,12 +3161,14 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                 elif not v["available"] and prev[h].get("available"):
                     went_oos.append(v)
             if new_products:
-                lines = [f"<b>🆕 KINOKUNIYA — {len(new_products)} New Pokemon TCG Listing(s)!</b>"]
+                tag = "🚨🎉 30th ANNIVERSARY — " if _kino_is_30th(new_products) else ""
+                lines = [f"<b>{tag}🆕 KINOKUNIYA — {len(new_products)} New Pokemon TCG Listing(s)!</b>"]
                 lines += [_kino_alert_line(v) for v in new_products]
                 await send_telegram("\n".join(lines), client)
                 log_events("kinokuniya", "new", new_products)
             if restocked:
-                lines = [f"<b>🟢 KINOKUNIYA — {len(restocked)} IN STOCK NOW!</b>"]
+                tag = "🚨🎉 30th ANNIVERSARY — " if _kino_is_30th(restocked) else ""
+                lines = [f"<b>{tag}🟢 KINOKUNIYA — {len(restocked)} IN STOCK NOW!</b>"]
                 lines += [_kino_alert_line(v, "✅") for v in restocked]
                 await send_telegram("\n".join(lines), client)
                 log_events("kinokuniya", "restock", restocked)
