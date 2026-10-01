@@ -2900,7 +2900,30 @@ KINO_SEARCH_MAX_PAGES  = 12
 # polled once a minute from Railway, that page drew HTTP 403 from about an hour
 # after go-live and ~96% of the time after that; the JSON feed is not blocked.
 KINO_FEED_URL          = KINO_BASE + "/products.json?limit=50"
-KINO_INTERVAL          = 60     # seconds, on its own loop (see monitor_loop)
+KINO_INTERVAL          = 30     # seconds, on its own loop (see monitor_loop)
+# Pacing (1 Oct 2026). A 30th Anniversary listing was live for about a minute,
+# so stock flips on watched products are checked every 30 s. To keep the load
+# low, only the fast passes' single-product /products/<handle>.js reads run that
+# often, and only for products not currently in stock; the store-wide feed and
+# the in-stock products are still read every KINO_FEED_EVERY s. Any 403/429
+# from the store drops the whole loop to KINO_SLOW_INTERVAL for KINO_SLOW_FOR s
+# (the once-a-minute HTML page got this loop blocked on 29-30 Sep).
+KINO_FEED_EVERY        = 60
+KINO_SLOW_INTERVAL     = 60
+KINO_SLOW_FOR          = 600
+_KINO = {"slow_until": 0.0}
+
+
+def _kino_note_status(code: int, what: str) -> None:
+    if code in (403, 429):
+        if time.time() >= _KINO["slow_until"]:
+            log.warning("Kinokuniya: HTTP %s on %s — slowing to %ds for %d min",
+                        code, what, KINO_SLOW_INTERVAL, KINO_SLOW_FOR // 60)
+        _KINO["slow_until"] = time.time() + KINO_SLOW_FOR
+
+
+def _kino_interval() -> int:
+    return KINO_SLOW_INTERVAL if time.time() < _KINO["slow_until"] else KINO_INTERVAL
 KINO_FULL_SEARCH_EVERY = 1800   # full walk takes ~60-90 s; new listings are caught every pass by the newest-first scan
 KINO_NEW_MAX_AGE_DAYS  = 7    # an older TCG listing first seen via search is a baseline gap, not news
 # Kinokuniya publishes a listing (out of stock), pulls it minutes later and
@@ -2918,6 +2941,10 @@ KINO_TCG_HINTS = ("tcg", "trading card", "card game", "booster", "blister", "eli
                   "poster collection", "special collection")
 _KINO_TCG_WORDS = re.compile(r"\b(?:tins?|decks?|etb|upc)\b")     # whole words: "tin" must not match "Tina"/"Tintin"
 _KINO_LINK_RE = re.compile(r"/products/([^?#/\"]+)")
+
+
+class _KinoSkipFeed(Exception):
+    """Internal: this pass does not read the store-wide feed."""
 
 
 def _kino_is_pokemon_tcg(title: str) -> bool:
@@ -2984,6 +3011,7 @@ async def _kino_product(cf, handle: str):
     if r.status_code == 404:
         return "gone"
     if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
+        _kino_note_status(r.status_code, "a product page")
         return None
     try:
         p = r.json()
@@ -3042,6 +3070,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
     prev     = (state.get("kinokuniya") or {}) if started else {}   # old-site keys are meaningless now
     now      = time.time()
     full_due = (not started) or now - float(state.get("_kino_full_at", 0) or 0) >= KINO_FULL_SEARCH_EVERY
+    feed_due = full_due or now - float(state.get("_kino_feed_at", 0) or 0) >= KINO_FEED_EVERY - 5
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
@@ -3062,6 +3091,8 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
             feed: dict[str, dict] = {}           # full details for TCG products in the feed
             newest_ok = False
             try:
+                if not feed_due:
+                    raise _KinoSkipFeed()
                 r = await cf.get(KINO_FEED_URL, headers=KINO_HDR, timeout=30)
                 if r.status_code == 200 and "kinokuniya.ae" in str(r.url):
                     for fp in r.json().get("products", []):
@@ -3073,8 +3104,12 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                             found[h] = t
                             feed[h] = _kino_from_feed(fp)
                     newest_ok = True
+                    state["_kino_feed_at"] = now
                 else:
+                    _kino_note_status(r.status_code, "the products feed")
                     log.warning("Kinokuniya: HTTP %s for the products feed", r.status_code)
+            except _KinoSkipFeed:
+                pass                                # fast pass: product pages only
             except Exception as exc:
                 log.warning("Kinokuniya: products feed failed: %s: %s", type(exc).__name__, exc)
 
@@ -3102,17 +3137,22 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
             if not started and not (newest_ok and search_ok):
                 log.warning("Kinokuniya: baseline needs every page — retrying next pass")
                 return state
-            if not newest_ok and not search_ok:
+            if feed_due and not newest_ok and not search_ok:
                 log.warning("Kinokuniya: all pages failed — skipping pass")
                 return state
 
             current: dict[str, dict] = {}
+            answered = 0                         # product pages that gave a real answer
             for h in dict.fromkeys(list(prev) + list(found)):
                 was = prev.get(h)
+                if not feed_due and was and was.get("available"):
+                    current[h] = was             # fast pass: only chase what we're waiting on
+                    continue
                 info = feed.get(h)
                 if info is None:
                     info = await _kino_product(cf, h)
                     await asyncio.sleep(random.uniform(0.3, 0.8))
+                    answered += info is not None
                 if info == "gone":
                     if was:
                         since = float(was.get("unlisted_at") or now)
@@ -3133,11 +3173,17 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                              "IN STOCK" if info["available"] else "still out of stock", info["title"])
                 current[h] = info
 
+            waiting = sum(1 for v in prev.values() if not v.get("available"))
+            if not feed_due and waiting and not answered:
+                log.warning("Kinokuniya: fast pass got no answers — skipping pass")
+                return state
+
         mark_ok(state, "kinokuniya")
         listed_n = sum(1 for v in current.values() if v.get("listed", True))
         log.info("Kinokuniya: %d Pokemon TCG product(s) listed, %d in stock, %d unlisted but watched%s",
                  listed_n, sum(1 for v in current.values() if v["available"]),
-                 len(current) - listed_n, " (full search)" if full_due else "")
+                 len(current) - listed_n,
+                 " (full search)" if full_due else ("" if feed_due else " (fast pass)"))
 
         if not started:
             in_stock = [v for v in current.values() if v["available"]]
@@ -5052,7 +5098,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                 raise
             except Exception as exc:
                 log.error("Kinokuniya loop error: %s", exc)
-            await asyncio.sleep(max(5.0, KINO_INTERVAL - (time.monotonic() - t0)))
+            await asyncio.sleep(max(5.0, _kino_interval() - (time.monotonic() - t0)))
 
     kino_task = asyncio.create_task(_kinokuniya_loop())
 
@@ -5329,7 +5375,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
                         f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
                         f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
-                        f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL // 60} min\n"
+                        f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL}s\n"
                         + (f"🃏 Lorcana ({sum(1 for c in LORCANA_CHECKS if c[0] not in DISABLED_RETAILERS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
                         f"🏴‍☠️ One Piece (Otakume/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
                         f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n\n"
