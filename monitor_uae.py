@@ -2903,6 +2903,12 @@ KINO_FEED_URL          = KINO_BASE + "/products.json?limit=50"
 KINO_INTERVAL          = 60     # seconds, on its own loop (see monitor_loop)
 KINO_FULL_SEARCH_EVERY = 1800   # full walk takes ~60-90 s; new listings are caught every pass by the newest-first scan
 KINO_NEW_MAX_AGE_DAYS  = 7    # an older TCG listing first seen via search is a baseline gap, not news
+# Kinokuniya publishes a listing (out of stock), pulls it minutes later and
+# republishes it, over and over (1 Oct 2026: three "new listing" alerts in 20
+# min for products that were never buyable). A pulled product is therefore
+# remembered as unlisted and still polled every pass: its return is silent
+# unless it is actually in stock. Forgotten after this many days unlisted.
+KINO_UNLISTED_KEEP_DAYS = 14
 KINO_NOT_TCG = ("sticker", "handbook", "book", "guide", "how to draw", "colouring", "coloring", "annual",
                 "manga", "puzzle", "encyclopedia", "adventures", "vol.", "graphic novel", "reader",
                 "atlas", "trivia", "word games", "pop!", "funko", "mug", "plush", "figure", "capsule",
@@ -3076,22 +3082,36 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
 
             current: dict[str, dict] = {}
             for h in dict.fromkeys(list(prev) + list(found)):
-                if h in feed:
-                    current[h] = feed[h]
-                    continue
-                info = await _kino_product(cf, h)
+                was = prev.get(h)
+                info = feed.get(h)
+                if info is None:
+                    info = await _kino_product(cf, h)
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
                 if info == "gone":
+                    if was:
+                        since = float(was.get("unlisted_at") or now)
+                        if now - since > KINO_UNLISTED_KEEP_DAYS * 86400:
+                            log.info("Kinokuniya: forgetting long-unlisted %s", was.get("title"))
+                            continue
+                        if was.get("listed", True):
+                            log.info("Kinokuniya: unlisted — %s", was.get("title"))
+                        current[h] = {**was, "available": False, "listed": False, "unlisted_at": since}
                     continue
                 if info is None:
-                    if h in prev:
-                        current[h] = prev[h]            # transient error: keep what we knew
+                    if was:
+                        current[h] = was                # transient error: keep what we knew
                     continue
+                info["listed"] = True
+                if was and not was.get("listed", True):
+                    log.info("Kinokuniya: relisted (%s) — %s",
+                             "IN STOCK" if info["available"] else "still out of stock", info["title"])
                 current[h] = info
-                await asyncio.sleep(random.uniform(0.3, 0.8))
 
         mark_ok(state, "kinokuniya")
-        log.info("Kinokuniya: %d Pokemon TCG product(s), %d in stock%s", len(current),
-                 sum(1 for v in current.values() if v["available"]), " (full search)" if full_due else "")
+        listed_n = sum(1 for v in current.values() if v.get("listed", True))
+        log.info("Kinokuniya: %d Pokemon TCG product(s) listed, %d in stock, %d unlisted but watched%s",
+                 listed_n, sum(1 for v in current.values() if v["available"]),
+                 len(current) - listed_n, " (full search)" if full_due else "")
 
         if not started:
             in_stock = [v for v in current.values() if v["available"]]
@@ -3120,6 +3140,8 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                             pass
                     if fresh:
                         new_products.append(v)
+                        log.info("Kinokuniya: NEW (%s) — %s",
+                                 "in stock" if v["available"] else "out of stock", v["title"])
                     else:
                         log.info("Kinokuniya: absorbing older listing first seen now: %s", v["title"])
                 elif v["available"] and not prev[h].get("available"):
@@ -3132,7 +3154,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                 await send_telegram("\n".join(lines), client)
                 log_events("kinokuniya", "new", new_products)
             if restocked:
-                lines = [f"<b>🟢 KINOKUNIYA — {len(restocked)} Back In Stock!</b>"]
+                lines = [f"<b>🟢 KINOKUNIYA — {len(restocked)} IN STOCK NOW!</b>"]
                 lines += [_kino_alert_line(v, "✅") for v in restocked]
                 await send_telegram("\n".join(lines), client)
                 log_events("kinokuniya", "restock", restocked)
