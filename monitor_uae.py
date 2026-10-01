@@ -2935,6 +2935,20 @@ def _kino_is_pokemon_tcg(title: str) -> bool:
     return "pokemon" in t and tcg_shaped
 
 
+# Kinokuniya's product handle IS the barcode, and The Pokemon Company's products
+# share a GS1 prefix. Across the whole 184k-product catalogue (1 Oct 2026) exactly
+# three handles carried it — the three TCG products — so a handle match is a
+# title-independent catch for anything Kinokuniya names oddly (e.g. a 30th
+# Anniversary product listed without "Pokemon" or any card word).
+KINO_POKEMON_BARCODES = ("0196214", "196214", "0820650", "820650")
+
+
+def _kino_match(handle: str, title: str) -> bool:
+    if title_excluded(title):
+        return False
+    return (handle or "").startswith(KINO_POKEMON_BARCODES) or _kino_is_pokemon_tcg(title)
+
+
 def _kino_is_30th(prods) -> bool:
     return any("30th" in strip_accents(v.get("title", "")) for v in prods)
 
@@ -3055,7 +3069,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                         if not h:
                             continue
                         newest.add(h)
-                        if _kino_is_pokemon_tcg(t):
+                        if _kino_match(h, t):
                             found[h] = t
                             feed[h] = _kino_from_feed(fp)
                     newest_ok = True
@@ -3077,7 +3091,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                         if not cs:
                             break
                         for h, t, _a in cs:
-                            if _kino_is_pokemon_tcg(t):
+                            if _kino_match(h, t):
                                 found[h] = t
                         await asyncio.sleep(random.uniform(0.4, 0.9))
                     search_ok = search_ok and term_ok
@@ -4615,11 +4629,16 @@ async def check_lt_30th(state: dict, client: httpx.AsyncClient) -> tuple[dict, b
         }
 
     prev = state.get("lt_30th") or {}
-    if not prev:
+    # Silent baseline once only. Little Things emptied this collection around
+    # 30 Sep 2026 (all seven listings unpublished); with "baseline whenever prev
+    # is empty" their return IN STOCK would have been absorbed silently here.
+    if not (state.get("_lt30_started") or "lt_30th" in state):
         state["lt_30th"] = current
+        state["_lt30_started"] = True
         log.info("LT 30th: watching %d product(s), %d in stock", len(current),
                  sum(1 for v in current.values() if v["available"]))
         return state, True
+    state["_lt30_started"] = True
 
     live = []   # (handle, product, is_new)
     for h, prod in current.items():
