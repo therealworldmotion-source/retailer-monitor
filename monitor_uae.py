@@ -1715,6 +1715,37 @@ SHOPIFY_TCG_HINTS = ("tcg", "booster", "elite trainer", "etb", "blister", "deck"
                      "gift box", "bundle", "card game", "portfolio w/booster")
 
 
+def _age_missing(prev: dict, current: dict, misses: int = 2) -> tuple[dict, list]:
+    """New state for checkers that MERGE: keep products missing from this pass,
+    but once one has been missing `misses` passes in a row mark it unlisted and
+    unavailable. Returns (state, products that were in stock when they vanished).
+
+    Plain merging kept a vanished product at its last-known availability. On
+    2 Oct 2026 ELC listed six 30th Anniversary products, they went in stock,
+    and ELC deleted them 17 minutes later; state still said "in stock", so a
+    relist in stock would have matched state and sent NO alert. Two misses are
+    required because search pages flicker."""
+    merged: dict = {}
+    removed: list = []
+    for h, old in prev.items():
+        if h in current:
+            continue
+        e = dict(old)
+        e["_miss"] = int(old.get("_miss", 0) or 0) + 1
+        if e["_miss"] >= misses and e.get("listed", True):
+            if e.get("available"):
+                removed.append(dict(old))
+            e["available"] = False
+            e["listed"] = False
+        merged[h] = e
+    merged.update(current)
+    return merged, removed
+
+
+def _is_30th(prods) -> bool:
+    return any("30th" in strip_accents(v.get("title", "")) for v in prods)
+
+
 async def check_shopify_collection(
     state: dict,
     client: httpx.AsyncClient,
@@ -1806,13 +1837,17 @@ async def check_shopify_collection(
                 elif pd["available"] != prev[h].get("available"):
                     (restocked if pd["available"] else went_oos).append(pd)
             if new_products:
-                lines = [f"<b>🆕 {headline} — {len(new_products)} New Product(s)!</b>"]
+                new_products.sort(key=lambda v: not v["available"])      # buyable ones first
+                live = sum(1 for v in new_products if v["available"])
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(new_products) else ""
+                lines = [f"<b>{tag}🆕 {headline} — {len(new_products)} New Product(s), {live} IN STOCK!</b>"]
                 for v in new_products:
                     lines.append(fmt_product(v) + _cart(v))
                 await send_telegram("\n".join(lines), client)
                 log_events(key, "new", new_products)
             if restocked:
-                lines = [f"<b>🟢 {headline} — {len(restocked)} Back In Stock!</b>"]
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(restocked) else ""
+                lines = [f"<b>{tag}🟢 {headline} — {len(restocked)} Back In Stock!</b>"]
                 for v in restocked:
                     lines.append(fmt_product(v, "✅") + _cart(v))
                 await send_telegram("\n".join(lines), client)
@@ -1826,8 +1861,14 @@ async def check_shopify_collection(
             if not (new_products or restocked or went_oos):
                 log.info("%s: no changes", log_name)
 
-        merged = dict(prev)
-        merged.update(current)
+        merged, removed = _age_missing(prev, current)
+        if removed:
+            lines = [f"<b>🔴 {headline} — {len(removed)} No Longer Listed</b>",
+                     "<i>Removed from the site while in stock. Links to them are dead; you'll be alerted if they return in stock.</i>"]
+            for v in removed:
+                lines.append(fmt_product(v, "❌"))
+            await send_telegram("\n".join(lines), client)
+            log.info("%s: %d product(s) no longer listed", log_name, len(removed))
         state[key] = merged
     except Exception as exc:
         log.error("%s check failed: %s", log_name, exc)
@@ -4011,13 +4052,17 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                     (restocked if prod["available"] else went_oos).append(prod)
 
             if new_products:
-                lines = [f"<b>🆕 ELC TOYS — {len(new_products)} New Product(s)!</b>"]
+                new_products.sort(key=lambda v: not v["available"])      # buyable ones first
+                live = sum(1 for v in new_products if v["available"])
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(new_products) else ""
+                lines = [f"<b>{tag}🆕 ELC TOYS — {len(new_products)} New Product(s), {live} IN STOCK!</b>"]
                 for p in new_products:
                     lines.append(fmt_product(p) + _cart_line(p))
                 await send_telegram("\n".join(lines), client)
                 log_events("elctoys", "new", new_products)
             if restocked:
-                lines = ["<b>🟢 ELC TOYS — Back In Stock!</b>"]
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(restocked) else ""
+                lines = [f"<b>{tag}🟢 ELC TOYS — {len(restocked)} Back In Stock!</b>"]
                 for p in restocked:
                     lines.append(fmt_product(p, "✅") + _cart_line(p))
                 await send_telegram("\n".join(lines), client)
@@ -4032,8 +4077,14 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
             if not (new_products or restocked or went_oos):
                 log.info("ELC Toys: no changes")
 
-        merged = state.get("elctoys", {})
-        merged.update(current)
+        merged, removed = _age_missing(state.get("elctoys") or {}, current)
+        if removed:
+            lines = [f"<b>🔴 ELC TOYS — {len(removed)} No Longer Listed</b>",
+                     "<i>Removed from the site while in stock. Links to them are dead; you'll be alerted if they return in stock.</i>"]
+            for p in removed:
+                lines.append(fmt_product(p, "❌"))
+            await send_telegram("\n".join(lines), client)
+            log.info("ELC Toys: %d product(s) no longer listed", len(removed))
         state["elctoys"] = merged
 
     except Exception as exc:
