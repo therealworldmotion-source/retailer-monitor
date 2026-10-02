@@ -1715,6 +1715,124 @@ SHOPIFY_TCG_HINTS = ("tcg", "booster", "elite trainer", "etb", "blister", "deck"
                      "gift box", "bundle", "card game", "portfolio w/booster")
 
 
+# ─── 30th ELITE TRAINER BOX ALARM ────────────────────────────────────────────
+#
+# 2 Oct 2026: Kinokuniya's 30th ETB was in stock for 2 h+ from 02:23 UK time and
+# the single alert sat unread; ELC's lasted 17 min and was noticed after 19. One
+# alert is not enough for the one product that matters most. While a 30th
+# Anniversary / Celebration Elite Trainer Box is in stock at any retailer, the
+# alarm re-sends every ETB_ALARM_EVERY s (every ETB_ALARM_SLOW_EVERY s after the
+# first ETB_ALARM_FAST_FOR s) until the user replies "ok" or it sells out. A
+# later restock re-arms it. Scans retailer state, so it covers every checker.
+
+ETB_ALARM_EVERY      = 60
+ETB_ALARM_FAST_FOR   = 1800
+ETB_ALARM_SLOW_EVERY = 300
+# Above this it is a reseller listing (retail is AED 279-299), not a drop.
+ETB_ALARM_MAX_PRICE  = float(os.environ.get("ETB_ALARM_MAX_PRICE", "400"))
+# Shopify stores: availability is re-checked on the product's own .js before
+# each alarm, because a search page can show a deleted product as in stock for
+# ~20 minutes (ELC did), and /cart/<variant>:1 opens checkout directly.
+ETB_ALARM_SHOPIFY_HOSTS = ("kinokuniya.ae", "pinca.ae", "elctoys.com", "littlethingsme.com",
+                           "toybox.ae", "otakume.com")
+ETB_ALARM_ACK_WORDS = ("ok", "okay", "k", "got it", "gotit", "ack", "done", "👍")
+_ETB_ALARM = {"ack_at": 0.0}
+
+
+def _is_30th_etb(title: str) -> bool:
+    t = strip_accents(title)
+    return ("30th" in t and ("elite trainer" in t or bool(re.search(r"\betb\b", t)))
+            and not title_excluded(title))
+
+
+def _etb_host(url: str) -> str:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _etb_candidates(state: dict) -> dict[str, tuple[str, dict]]:
+    """In-stock 30th ETBs across every retailer's state, keyed by product URL."""
+    out: dict[str, tuple[str, dict]] = {}
+    for site, prods in state.items():
+        if (site.startswith("_") or not isinstance(prods, dict) or site in DISABLED_RETAILERS
+                or site.endswith(("_lorcana", "_onepiece"))):
+            continue
+        for v in prods.values():
+            if not isinstance(v, dict) or not v.get("available") or not v.get("url"):
+                continue
+            if not _is_30th_etb(v.get("title", "")):
+                continue
+            pv = price_value(v.get("price"))
+            if pv is not None and pv > ETB_ALARM_MAX_PRICE:
+                continue
+            out.setdefault(str(v["url"]).split("?")[0].rstrip("/"), (site, v))
+    return out
+
+
+async def _etb_still_live(client: httpx.AsyncClient, url: str):
+    """True/False from the store's own product data; None if it can't be checked."""
+    if _etb_host(url) not in ETB_ALARM_SHOPIFY_HOSTS or "/products/" not in url:
+        return None
+    try:
+        r = await client.get(url + ".js", headers=get_json_headers(), timeout=15)
+    except Exception:
+        return None
+    if r.status_code == 404:
+        return False
+    if r.status_code != 200:
+        return None
+    try:
+        return bool(json.loads(r.content).get("available"))
+    except Exception:
+        return None
+
+
+async def etb_alarm_tick(state: dict, client: httpx.AsyncClient) -> bool:
+    """Send or repeat the 30th ETB alarm. Returns True if state changed."""
+    alarms = state.setdefault("_etb_alarm", {})
+    cands = _etb_candidates(state)
+    now = time.time()
+    changed = False
+    for url in [u for u in alarms if u not in cands]:
+        del alarms[url]                     # sold out or gone: a restock re-arms it
+        changed = True
+    for url, (site, v) in cands.items():
+        a = alarms.get(url)
+        if a is None:
+            a = alarms[url] = {"first": now, "last": 0.0, "count": 0, "acked": False}
+            changed = True
+        if not a["acked"] and _ETB_ALARM["ack_at"] >= a["first"]:
+            a["acked"] = True
+            changed = True
+            log.info("ETB alarm acknowledged: %s", v.get("title"))
+        if a["acked"]:
+            continue
+        every = ETB_ALARM_EVERY if now - a["first"] < ETB_ALARM_FAST_FOR else ETB_ALARM_SLOW_EVERY
+        if now - a["last"] < every:
+            continue
+        a["last"] = now
+        changed = True
+        if await _etb_still_live(client, url) is False:
+            log.info("ETB alarm: store says not buyable, skipping — %s", v.get("title"))
+            continue
+        a["count"] += 1
+        host = _etb_host(url)
+        buy = (f"https://{urllib.parse.urlparse(url).netloc}/cart/{v['variant_id']}:1"
+               if v.get("variant_id") and host in ETB_ALARM_SHOPIFY_HOSTS else url)
+        label = RETAILER_LABELS.get(site) or RETAILER_LABELS.get("little_things" if site == "lt_30th" else site, site)
+        mins = int((now - a["first"]) // 60)
+        await send_telegram(
+            f"<b>🚨🚨🚨 30th ELITE TRAINER BOX IN STOCK — {label} 🚨🚨🚨</b>\n\n"
+            f"{v.get('title', '')} — <b>{v.get('price', '')}</b>\n\n"
+            f'👉 <a href="{buy}"><b>CHECKOUT NOW</b></a>\n'
+            f'<a href="{url}">product page</a>\n\n'
+            f"<i>Alert {a['count']}, in stock for {mins} min. Reply <code>ok</code> to stop these.</i>",
+            client,
+        )
+        log.info("ETB alarm #%d sent: %s (%s)", a["count"], v.get("title"), site)
+    return changed
+
+
 def _age_missing(prev: dict, current: dict, misses: int = 2) -> tuple[dict, list]:
     """New state for checkers that MERGE: keep products missing from this pass,
     but once one has been missing `misses` passes in a row mark it unlisted and
@@ -5153,6 +5271,21 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     kino_task = asyncio.create_task(_kinokuniya_loop())
 
+    # ── 30th Elite Trainer Box alarm: repeats until "ok" or sold out ──────────
+    async def _etb_alarm_loop() -> None:
+        nonlocal state
+        while True:
+            try:
+                if await etb_alarm_tick(state, client):
+                    save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("ETB alarm loop error: %s", exc)
+            await asyncio.sleep(15)
+
+    etb_task = asyncio.create_task(_etb_alarm_loop())
+
     try:
         while True:
             now = time.monotonic()
@@ -5341,6 +5474,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     finally:
         lt_task.cancel()
         kino_task.cancel()
+        etb_task.cancel()
         try:
             await headless_context.close()
         except Exception:
@@ -5436,6 +5570,13 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         client,
                     )
                     log.info("Monitor started via Telegram")
+
+            elif text in ETB_ALARM_ACK_WORDS:
+                _ETB_ALARM["ack_at"] = time.time()
+                await send_telegram(
+                    "👍 <b>Got it.</b> Elite Trainer Box alarm silenced for what's in stock now. "
+                    "A fresh restock will set it off again.", client)
+                log.info("ETB alarm acknowledged via Telegram")
 
             elif text == "stop":
                 if not holder["task"] or holder["task"].done():
