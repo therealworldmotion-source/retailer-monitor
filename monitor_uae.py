@@ -61,10 +61,28 @@ STATE_FILE  = DATA_DIR / "state_uae.json"
 # stay in the file; remove a key here to bring one back.
 ALWAYS_DISABLED = {"legends_own_the_game", "legends_onepiece", "legends_lorcana"}
 
+# PAUSED 9 Oct 2026 (Gurps' call): from ~06:00 UTC that day Shopify refused
+# Railway's shared Amsterdam address with HTTP 429 on Little Things, Toybox,
+# Pinca and Otakume; backing off did not clear it (Little Things completed 22
+# of ~550 checks in 7 hours). He chose not to move or pay for another server
+# and to keep only what works — Amazon and Kinokuniya — while he looks into
+# the rest. Everything else is paused here, working retailers included, per
+# his instruction "stop all them minus amazon and kino". To bring one back,
+# delete its key from this set and redeploy; the checker code is untouched.
+PAUSED_RETAILERS = {
+    "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
+    "otakume", "otakume_onepiece", "pinca", "toybox",
+    "virgin_megastore", "virgin_megastore_onepiece", "virgin_sitemap",
+    "colorland_toys", "magrudy", "zgames", "toycorner", "elctoys", "dabdoob",
+    "virgin_lorcana", "magrudy_lorcana", "little_things_lorcana",
+    "otakume_lorcana", "colorland_lorcana", "toycorner_lorcana",
+}
+# Still running: amazon_ae, amazon_onepiece, kinokuniya, kinokuniya_lorcana.
+
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
 DISABLED_RETAILERS = {
     s.strip().lower() for s in os.environ.get("DISABLED_RETAILERS", "").split(",") if s.strip()
-} | ALWAYS_DISABLED
+} | ALWAYS_DISABLED | PAUSED_RETAILERS
 
 # ─── LORCANA GO-LIVE GATE ─────────────────────────────────────────────────────
 # The Lorcana watchers stay dormant until this moment, then switch on
@@ -5579,20 +5597,12 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                     watchdog_task  = asyncio.create_task(run_watchdog(holder, client, _spawn_monitor))
                     await send_telegram(
                         "✅ <b>UAE Retailer Monitor started!</b>\n\n"
-                        f"🟡 Otakume: every {INTERVALS['otakume'] // 60} min\n"
-                        f"🇦🇪 Virgin Megastore: every {INTERVALS['virgin_megastore'] // 60} min\n"
-                        f"🧩 Colorland Toys: every {INTERVALS['colorland_toys'] // 60} min\n"
-                        f"📚 Magrudy: every {INTERVALS['magrudy'] // 60} min\n"
-                        f"🕹️ ZGames: every {INTERVALS['zgames'] // 60} min\n"
-                        f"🛒 Geekay: every {INTERVALS.get('geekay', 180) // 60} min\n"
-                        f"🛍️ Little Things: every {INTERVALS.get('little_things', 60) // 60} min\n"
-                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
                         f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL}s\n"
-                        + (f"🃏 Lorcana ({sum(1 for c in LORCANA_CHECKS if c[0] not in DISABLED_RETAILERS)} stores): LIVE, every {INTERVALS.get('lorcana', 120) // 60} min\n"
-                        f"🏴‍☠️ One Piece (Otakume/Amazon): every {INTERVALS.get('onepiece', 180) // 60} min\n"
-                        f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n\n"
-                           if lorcana_active() else
-                           f"🃏 Lorcana ({len(LORCANA_CHECKS)} stores): armed, activates {LORCANA_GO_LIVE:%H:%M UTC %d %b}\n\n")
+                        f"📦 Amazon.ae: every {INTERVALS.get('amazon_ae', 600) // 60} min\n"
+                        f"🏴‍☠️ Amazon One Piece: every {INTERVALS.get('onepiece', 180) // 60} min\n"
+                        f"🃏 Kinokuniya Lorcana: every {INTERVALS.get('lorcana', 120) // 60} min\n\n"
+                        f"⏸️ Paused: {len(PAUSED_RETAILERS)} other checks (Little Things, Otakume, Pinca, Toybox, "
+                        "Virgin, Colorland, Magrudy, Toy Corner, ELC, Dabdoob).\n\n"
                         + "Send <code>stop</code> to pause.",
                         client,
                     )
