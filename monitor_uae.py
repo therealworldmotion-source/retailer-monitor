@@ -4539,6 +4539,10 @@ async def check_geekay(state: dict, client: httpx.AsyncClient) -> dict:
 
 # ─── LITTLE THINGS ME (Shopify JSON) ─────────────────────────────────────────
 
+LT_SEARCH_EVERY = 5
+_LT_MAIN = {"pass": 0}
+
+
 async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
     """Little Things ME — Shopify store. Pure HTTP JSON API, no browser needed.
     Only alerts on in-stock items — too many OOS products to list."""
@@ -4596,7 +4600,17 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
         # collection above covers the TCG catalogue with full data. Products
         # already found in the collection keep their richer collection data.
         collection_count = len(current)
-        for q in ("pokemon", "pok%C3%A9mon"):
+        # The two searches were half of this checker's requests. Run them every
+        # LT_SEARCH_EVERY-th pass; on the others carry forward the search-only
+        # products from last time (they are the ones with variant_id None), or
+        # they would drop out and be re-announced as new on the next search pass.
+        _LT_MAIN["pass"] += 1
+        search_pass = _LT_MAIN["pass"] % LT_SEARCH_EVERY == 1
+        if not search_pass:
+            for h, v in (state.get("little_things") or {}).items():
+                if h not in current and isinstance(v, dict) and v.get("variant_id") is None:
+                    current[h] = v
+        for q in (("pokemon", "pok%C3%A9mon") if search_pass else ()):
             try:
                 surl = (
                     "https://littlethingsme.com/search/suggest.json"
@@ -4773,6 +4787,10 @@ LT_30TH_INTERVAL  = 15     # seconds — one small request (the 7-product collec
 LT_MAIN_INTERVAL  = 45
 LT_OP_INTERVAL    = 60
 LT_ALERT_COOLDOWN = 300    # one stock alert per product per 5 min, across both watchers
+# Little Things deleted the 30th collection around 30 Sep; polling an empty
+# collection every 15 s was ~240 wasted requests an hour. Poll slowly while it
+# is empty; the 45 s main checker still covers the products if they return.
+LT_30TH_EMPTY_INTERVAL = 300
 _LT30 = {"backoff_until": 0.0, "last_status": 200}
 
 
@@ -5155,8 +5173,15 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     # pure noise (7 in 5 h on 19 Sep 2026). Health still shows on the status board.
     SILENT_FAIL_SITES = {"amazon_ae", "amazon_onepiece"}
 
+    # A site that fails, gets one check through, then fails again used to ping
+    # FAILING on every cycle (30 pings on 9 Oct). It now has to stay healthy
+    # for FAIL_REARM_AFTER seconds before it can ping again.
+    FAIL_REARM_AFTER = 1800
+    LAST_FAIL_AT: dict[str, float] = {}
+
     async def _track_failure(site: str, error_msg: str) -> None:
         FAIL_COUNTS[site] = FAIL_COUNTS.get(site, 0) + 1
+        LAST_FAIL_AT[site] = time.monotonic()
         if FAIL_COUNTS[site] >= 3 and not FAIL_ALERTED.get(site):
             if site in SILENT_FAIL_SITES:
                 log.warning("%s: %d consecutive failures (Telegram alert suppressed)", site, FAIL_COUNTS[site])
@@ -5174,7 +5199,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         if FAIL_COUNTS.get(site, 0) > 0:
             log.info("%s: recovered after %d failures", site, FAIL_COUNTS[site])
         FAIL_COUNTS[site] = 0
-        FAIL_ALERTED[site] = False
+        if time.monotonic() - LAST_FAIL_AT.get(site, -1e9) >= FAIL_REARM_AFTER:
+            FAIL_ALERTED[site] = False
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
@@ -5233,7 +5259,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
                     await _push_status()
 
                 t = time.monotonic()
-                if "lt_30th" not in DISABLED_RETAILERS and t - last_30th >= INTERVALS.get("lt_30th", LT_30TH_INTERVAL):
+                lt30_every = INTERVALS.get("lt_30th", LT_30TH_INTERVAL) if state.get("lt_30th") else LT_30TH_EMPTY_INTERVAL
+                if "lt_30th" not in DISABLED_RETAILERS and t - last_30th >= lt30_every:
                     last_30th = t
                     state, changed = await check_lt_30th(state, client)
                     if changed:
@@ -5688,6 +5715,63 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
+# ─── PER-HOST BACKOFF ────────────────────────────────────────────────────────
+#
+# 9 Oct 2026, ~06:00 UTC: Shopify began answering Railway's IP with HTTP 429
+# across littlethingsme.com, otakume.com, pinca.ae and toybox.ae at once (zero
+# 429s on 2-8 Oct at the same pace). Every checker just skipped the pass and
+# tried again on its normal timer, so the limit never lifted: Little Things
+# completed 23% of its checks and the FAILING pings repeated all day.
+#
+# This transport sits under the shared httpx client. When a host answers 429
+# it is left alone for a growing interval (or the server's Retry-After if
+# longer); requests to it in that window get a local 429 without touching the
+# network, which the checkers already treat as "skip this pass". Any success
+# resets the interval. Telegram is exempt so alerts are never held back.
+
+BACKOFF_STEPS  = (30, 60, 120, 300)        # seconds; last value repeats
+BACKOFF_EXEMPT = ("api.telegram.org",)
+_HOST_BACKOFF: dict[str, dict] = {}
+
+
+def _backoff_until(host: str) -> float:
+    return float(_HOST_BACKOFF.get(host, {}).get("until", 0.0))
+
+
+def _note_host_status(host: str, status: int, retry_after: str | None = None) -> None:
+    if status == 429:
+        b = _HOST_BACKOFF.setdefault(host, {"step": -1, "until": 0.0})
+        b["step"] = min(b["step"] + 1, len(BACKOFF_STEPS) - 1)
+        wait = float(BACKOFF_STEPS[b["step"]])
+        try:
+            wait = max(wait, min(float(retry_after), 900.0)) if retry_after else wait
+        except (TypeError, ValueError):
+            pass
+        b["until"] = time.time() + wait
+        log.warning("%s answered 429 — leaving it alone for %.0f s", host, wait)
+    elif status < 400 and host in _HOST_BACKOFF:
+        log.info("%s is answering again — backoff cleared", host)
+        del _HOST_BACKOFF[host]
+
+
+class BackoffTransport(httpx.AsyncBaseTransport):
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host in BACKOFF_EXEMPT:
+            return await self._inner.handle_async_request(request)
+        if time.time() < _backoff_until(host):
+            return httpx.Response(429, headers={"x-monitor-backoff": "1"}, content=b"", request=request)
+        resp = await self._inner.handle_async_request(request)
+        _note_host_status(host, resp.status_code, resp.headers.get("retry-after"))
+        return resp
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 async def main() -> None:
     log.info("=" * 60)
     log.info("UAE Pokemon TCG Monitor — Starting")
@@ -5698,6 +5782,7 @@ async def main() -> None:
     async with httpx.AsyncClient(
         timeout=35,
         follow_redirects=True,
+        transport=BackoffTransport(httpx.AsyncHTTPTransport()),
     ) as client:
         async with async_playwright() as pw:
             headless_browser = await launch_headless_browser(pw)
