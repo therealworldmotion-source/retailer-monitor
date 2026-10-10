@@ -5790,7 +5790,7 @@ class BackoffTransport(httpx.AsyncBaseTransport):
 # boot (recorded in state), uses a plain client WITHOUT the back-off layer so
 # nothing is masked, logs "PROBE" lines, and never alerts. ~25 requests.
 
-PROBE_ID = "2026-10-10a"
+PROBE_ID = "2026-10-10b-singapore"   # re-run after moving the service to asia-southeast1
 _PROBE_HDRS = ("retry-after", "server", "cf-ray", "cf-mitigated", "cf-cache-status", "x-request-id",
                "shopify-complexity-score", "shopify-complexity-score-v2", "x-dc", "content-type")
 
@@ -5824,7 +5824,7 @@ async def run_block_probe(state: dict) -> None:
                 log.info("PROBE egress: ip=%s org=%s city=%s country=%s", ip.get("ip"), ip.get("org"), ip.get("city"), ip.get("country"))
             except Exception as exc:
                 log.info("PROBE egress lookup failed: %s", type(exc).__name__)
-            log.info("PROBE step A: first request to each store after ~10 h with no traffic from us")
+            log.info("PROBE step A (%s): first request to each store", PROBE_ID)
             await hit("A LT collection feed", lt)
             await asyncio.sleep(4); await hit("A Pinca collection feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250")
             await asyncio.sleep(4); await hit("A Toybox collection feed", "https://toybox.ae/collections/pokemon/products.json?limit=250")
