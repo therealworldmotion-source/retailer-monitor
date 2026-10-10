@@ -5315,6 +5315,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             await asyncio.sleep(max(5.0, _kino_interval() - (time.monotonic() - t0)))
 
     kino_task = asyncio.create_task(_kinokuniya_loop())
+    probe_task = asyncio.create_task(run_block_probe(state))   # one-off diagnostic, see PROBE_ID
 
     # ── 30th Elite Trainer Box alarm: repeats until "ok" or sold out ──────────
     async def _etb_alarm_loop() -> None:
@@ -5519,6 +5520,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     finally:
         lt_task.cancel()
         kino_task.cancel()
+        probe_task.cancel()
         etb_task.cancel()
         try:
             await headless_context.close()
@@ -5780,6 +5782,70 @@ class BackoffTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._inner.aclose()
+
+
+# ─── ONE-OFF BLOCK PROBE ─────────────────────────────────────────────────────
+#
+# Diagnostic for the 9 Oct 2026 Shopify refusals. Runs once per PROBE_ID after
+# boot (recorded in state), uses a plain client WITHOUT the back-off layer so
+# nothing is masked, logs "PROBE" lines, and never alerts. ~25 requests.
+
+PROBE_ID = "2026-10-10a"
+_PROBE_HDRS = ("retry-after", "server", "cf-ray", "cf-mitigated", "cf-cache-status", "x-request-id",
+               "shopify-complexity-score", "shopify-complexity-score-v2", "x-dc", "content-type")
+
+
+async def run_block_probe(state: dict) -> None:
+    if state.get("_probe_done") == PROBE_ID:
+        return
+    state["_probe_done"] = PROBE_ID
+    save_state(state)
+    lt   = "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250"
+    kino = "https://kinokuniya.ae/products.json?limit=50"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            async def hit(label: str, url: str) -> int:
+                try:
+                    r = await c.get(url, headers=get_json_headers(), timeout=30)
+                except Exception as exc:
+                    log.info("PROBE %-28s ERR %s", label, type(exc).__name__)
+                    return -1
+                h = {k: r.headers.get(k) for k in _PROBE_HDRS if r.headers.get(k)}
+                body = re.sub(r"\s+", " ", r.text[:400]) if r.status_code != 200 else ""
+                log.info("PROBE %-28s HTTP %s | %s%s", label, r.status_code, json.dumps(h),
+                         f" | body: {body[:220]}" if body else "")
+                if r.status_code == 429:
+                    log.info("PROBE %-28s all header names: %s", label, sorted(r.headers.keys()))
+                return r.status_code
+
+            await asyncio.sleep(45)                                  # let the boot burst pass
+            try:
+                ip = (await c.get("https://ipinfo.io/json", timeout=20)).json()
+                log.info("PROBE egress: ip=%s org=%s city=%s country=%s", ip.get("ip"), ip.get("org"), ip.get("city"), ip.get("country"))
+            except Exception as exc:
+                log.info("PROBE egress lookup failed: %s", type(exc).__name__)
+            log.info("PROBE step A: first request to each store after ~10 h with no traffic from us")
+            await hit("A LT collection feed", lt)
+            await asyncio.sleep(4); await hit("A Pinca collection feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250")
+            await asyncio.sleep(4); await hit("A Toybox collection feed", "https://toybox.ae/collections/pokemon/products.json?limit=250")
+            await asyncio.sleep(4); await hit("A Otakume collection page", "https://otakume.com/collections/pokemon")
+            await asyncio.sleep(4); await hit("A ELC search page", "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product")
+            await asyncio.sleep(4); await hit("A LT sitemap (zero cost)", "https://littlethingsme.com/sitemap.xml")
+            await asyncio.sleep(4); await hit("A Kino feed, plain client", kino)
+            log.info("PROBE step B: Little Things feed, 8 requests 5 s apart")
+            await asyncio.sleep(30)
+            codes = []
+            for i in range(8):
+                codes.append(await hit(f"B LT feed #{i + 1}", lt)); await asyncio.sleep(5)
+            log.info("PROBE step B result: %s", codes)
+            log.info("PROBE step C: after a 60 s rest")
+            await asyncio.sleep(60)
+            await hit("C LT feed after rest", lt)
+            for i in range(3):
+                await asyncio.sleep(5); await hit(f"C Kino feed plain #{i + 1}", kino)
+            log.info("PROBE done")
+    except Exception as exc:
+        log.error("PROBE failed: %s: %s", type(exc).__name__, exc)
 
 
 async def main() -> None:
