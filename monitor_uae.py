@@ -69,15 +69,21 @@ ALWAYS_DISABLED = {"legends_own_the_game", "legends_onepiece", "legends_lorcana"
 # the rest. Everything else is paused here, working retailers included, per
 # his instruction "stop all them minus amazon and kino". To bring one back,
 # delete its key from this set and redeploy; the checker code is untouched.
+# 10 Oct: Virgin, Colorland, Magrudy, Toy Corner and Dabdoob were never
+# refused — they are not Shopify-hosted — so they are back on. What stays
+# paused is the five Shopify stores Shopify's edge refuses from Railway
+# (probed again from a brand-new Singapore address: refused on the first
+# request), plus ZGames, which was already off before this.
 PAUSED_RETAILERS = {
     "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
-    "otakume", "otakume_onepiece", "pinca", "toybox",
-    "virgin_megastore", "virgin_megastore_onepiece", "virgin_sitemap",
-    "colorland_toys", "magrudy", "zgames", "toycorner", "elctoys", "dabdoob",
-    "virgin_lorcana", "magrudy_lorcana", "little_things_lorcana",
-    "otakume_lorcana", "colorland_lorcana", "toycorner_lorcana",
+    "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
+    "little_things_lorcana", "otakume_lorcana",
+    "zgames",
 }
-# Still running: amazon_ae, amazon_onepiece, kinokuniya, kinokuniya_lorcana.
+# Running: amazon_ae, amazon_onepiece, kinokuniya, kinokuniya_lorcana,
+# virgin_megastore, virgin_megastore_onepiece, virgin_sitemap, colorland_toys,
+# magrudy, toycorner, dabdoob, and the Virgin/Magrudy/Colorland/ToyCorner
+# Lorcana watchers.
 
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
 DISABLED_RETAILERS = {
@@ -5601,10 +5607,15 @@ async def telegram_listener(client: httpx.AsyncClient, browser, headless_browser
                         "✅ <b>UAE Retailer Monitor started!</b>\n\n"
                         f"📚 Kinokuniya (kinokuniya.ae): every {KINO_INTERVAL}s\n"
                         f"📦 Amazon.ae: every {INTERVALS.get('amazon_ae', 600) // 60} min\n"
-                        f"🏴‍☠️ Amazon One Piece: every {INTERVALS.get('onepiece', 180) // 60} min\n"
-                        f"🃏 Kinokuniya Lorcana: every {INTERVALS.get('lorcana', 120) // 60} min\n\n"
-                        f"⏸️ Paused: {len(PAUSED_RETAILERS)} other checks (Little Things, Otakume, Pinca, Toybox, "
-                        "Virgin, Colorland, Magrudy, Toy Corner, ELC, Dabdoob).\n\n"
+                        f"🇦🇪 Virgin Megastore: every {INTERVALS['virgin_megastore'] // 60} min\n"
+                        f"🧩 Colorland Toys: every {INTERVALS['colorland_toys'] // 60} min\n"
+                        f"📚 Magrudy: every {INTERVALS['magrudy'] // 60} min\n"
+                        f"🧸 Toy Corner: every {INTERVALS.get('toycorner', 180) // 60} min\n"
+                        f"🧸 Dabdoob: every {INTERVALS.get('dabdoob', 600) // 60} min\n"
+                        f"🏴‍☠️ One Piece (Amazon/Virgin): every {INTERVALS.get('onepiece', 180) // 60} min\n"
+                        f"🃏 Lorcana ({sum(1 for c in LORCANA_CHECKS if c[0] not in DISABLED_RETAILERS)} stores): every {INTERVALS.get('lorcana', 120) // 60} min\n\n"
+                        "⏸️ Paused: Little Things, Otakume, Pinca, Toybox, ELC — Shopify refuses "
+                        "automated requests from Railway's address.\n\n"
                         + "Send <code>stop</code> to pause.",
                         client,
                     )
