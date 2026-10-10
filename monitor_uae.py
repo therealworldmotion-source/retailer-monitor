@@ -13,6 +13,7 @@ Sites monitored:
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import platform
 import random
@@ -25,7 +26,11 @@ from pathlib import Path
 
 import httpx
 from bs4 import BeautifulSoup
-from patchright.async_api import BrowserContext, async_playwright
+try:
+    from patchright.async_api import BrowserContext, async_playwright
+except ImportError:      # slim home install (MONITOR_ROLE=home): those checks need no browser
+    BrowserContext = None
+    async_playwright = None
 
 
 def _default_chrome_path() -> str | None:
@@ -85,10 +90,22 @@ PAUSED_RETAILERS = {
 # magrudy, toycorner, dabdoob, and the Virgin/Magrudy/Colorland/ToyCorner
 # Lorcana watchers.
 
+# MONITOR_ROLE=home is the slim runner for a machine on a home connection (the
+# spare Surface). It runs ONLY the Shopify-hosted stores that Shopify's edge
+# refuses from Railway, with the same honest plain client, and sends alerts
+# through the same bot. Railway ("cloud") keeps everything else, the Telegram
+# command listener, and has these stores paused. See home_main().
+MONITOR_ROLE   = os.environ.get("MONITOR_ROLE", "cloud").strip().lower()
+HOME_RETAILERS = {
+    "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
+    "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
+    "little_things_lorcana", "otakume_lorcana",
+}
+
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
 DISABLED_RETAILERS = {
     s.strip().lower() for s in os.environ.get("DISABLED_RETAILERS", "").split(",") if s.strip()
-} | ALWAYS_DISABLED | PAUSED_RETAILERS
+} | ALWAYS_DISABLED | (set() if MONITOR_ROLE == "home" else PAUSED_RETAILERS)
 
 # ─── LORCANA GO-LIVE GATE ─────────────────────────────────────────────────────
 # The Lorcana watchers stay dormant until this moment, then switch on
@@ -234,7 +251,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("monitor_uae.log"),
+        logging.handlers.RotatingFileHandler(str(DATA_DIR / "monitor_uae.log") if MONITOR_ROLE == "home" else "monitor_uae.log",
+                                             maxBytes=10_000_000, backupCount=3, encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -1811,7 +1829,7 @@ async def _etb_still_live(client: httpx.AsyncClient, url: str):
         return None
 
 
-async def etb_alarm_tick(state: dict, client: httpx.AsyncClient) -> bool:
+async def etb_alarm_tick(state: dict, client: httpx.AsyncClient, max_count: int = 0) -> bool:
     """Send or repeat the 30th ETB alarm. Returns True if state changed."""
     alarms = state.setdefault("_etb_alarm", {})
     cands = _etb_candidates(state)
@@ -1829,7 +1847,7 @@ async def etb_alarm_tick(state: dict, client: httpx.AsyncClient) -> bool:
             a["acked"] = True
             changed = True
             log.info("ETB alarm acknowledged: %s", v.get("title"))
-        if a["acked"]:
+        if a["acked"] or (max_count and a["count"] >= max_count):
             continue
         every = ETB_ALARM_EVERY if now - a["first"] < ETB_ALARM_FAST_FOR else ETB_ALARM_SLOW_EVERY
         if now - a["last"] < every:
@@ -1850,7 +1868,8 @@ async def etb_alarm_tick(state: dict, client: httpx.AsyncClient) -> bool:
             f"{v.get('title', '')} — <b>{v.get('price', '')}</b>\n\n"
             f'👉 <a href="{buy}"><b>CHECKOUT NOW</b></a>\n'
             f'<a href="{url}">product page</a>\n\n'
-            f"<i>Alert {a['count']}, in stock for {mins} min. Reply <code>ok</code> to stop these.</i>",
+            f"<i>Alert {a['count']}, in stock for {mins} min. "
+            + (f"Stops by itself after {max_count} alerts.</i>" if max_count else "Reply <code>ok</code> to stop these.</i>"),
             client,
         )
         log.info("ETB alarm #%d sent: %s (%s)", a["count"], v.get("title"), site)
@@ -5859,6 +5878,103 @@ async def run_block_probe(state: dict) -> None:
         log.error("PROBE failed: %s: %s", type(exc).__name__, exc)
 
 
+# ─── HOME ROLE (MONITOR_ROLE=home) ────────────────────────────────────────────
+#
+# Shopify's edge refuses automated requests from cloud servers (Railway, both
+# Amsterdam and Singapore, refused on the first request) but answers a home
+# connection normally. This runner is what the spare Surface executes: only the
+# HOME_RETAILERS checks, the same plain client and back-off layer, no browser,
+# no Telegram command listener (Railway owns that; two pollers on one bot
+# conflict). Because it cannot hear "ok", its Elite Trainer Box alarm stops
+# by itself after ETB_ALARM_HOME_MAX messages.
+
+HOME_FAIL_REARM     = 1800
+ETB_ALARM_HOME_MAX  = 60
+
+
+async def home_main() -> None:
+    log.info("=" * 60)
+    log.info("Home checker starting (MONITOR_ROLE=home) — %s", ", ".join(sorted(HOME_RETAILERS)))
+    log.info("=" * 60)
+    state = load_state()
+    quick = [      # Little Things on its own task, so the slower stores never delay it
+        ("little_things",          check_little_things,          lambda st: LT_MAIN_INTERVAL),
+        ("little_things_onepiece", check_little_things_onepiece, lambda st: LT_OP_INTERVAL),
+        ("lt_30th",                check_lt_30th,
+         lambda st: LT_30TH_INTERVAL if st.get("lt_30th") else LT_30TH_EMPTY_INTERVAL),
+    ]
+    others = [
+        ("pinca",                 check_pinca,                 lambda st: 120),
+        ("toybox",                check_toybox,                lambda st: 120),
+        ("otakume",               check_otakume,               lambda st: 120),
+        ("otakume_onepiece",      check_otakume_onepiece,      lambda st: 180),
+        ("elctoys",               check_elctoys,               lambda st: 120),
+        ("littlethings_backend",  check_littlethings_backend,  lambda st: 600),
+        ("little_things_lorcana", check_little_things_lorcana, lambda st: 120),
+        ("otakume_lorcana",       check_otakume_lorcana,       lambda st: 120),
+    ]
+    health: dict[str, dict] = {}
+
+    async with httpx.AsyncClient(
+        timeout=35,
+        follow_redirects=True,
+        transport=BackoffTransport(httpx.AsyncHTTPTransport()),
+    ) as client:
+
+        async def note_health(key: str, every: float) -> None:
+            h = health.setdefault(key, {"alerted": False, "bad_at": 0.0})
+            if check_is_stale(state, key, every):
+                h["bad_at"] = time.monotonic()
+                if not h["alerted"]:
+                    h["alerted"] = True
+                    await send_telegram(
+                        f"⚠️ <b>HOME CHECKER — {RETAILER_LABELS.get(key, key)} not getting through</b>\n\n"
+                        "No successful check for a while. It keeps trying.", client)
+            elif h["alerted"] and time.monotonic() - h["bad_at"] >= HOME_FAIL_REARM:
+                h["alerted"] = False
+
+        async def run_group(group) -> None:
+            last: dict[str, float] = {}
+            while True:
+                for key, fn, every in group:
+                    if key in DISABLED_RETAILERS:
+                        continue
+                    iv = every(state)
+                    if time.monotonic() - last.get(key, -1e9) < iv:
+                        continue
+                    last[key] = time.monotonic()
+                    try:
+                        await asyncio.wait_for(fn(state, client), timeout=240)   # checkers update `state` in place
+                    except asyncio.TimeoutError:
+                        log.warning("%s: check timed out", key)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.error("%s check crashed: %s: %s", key, type(exc).__name__, exc)
+                    try:
+                        await note_health(key, iv)
+                        save_state(state)
+                    except Exception as exc:
+                        log.error("home bookkeeping failed for %s: %s", key, exc)
+                await asyncio.sleep(2)
+
+        async def alarm_loop() -> None:
+            while True:
+                try:
+                    if await etb_alarm_tick(state, client, max_count=ETB_ALARM_HOME_MAX):
+                        save_state(state)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("ETB alarm loop error: %s", exc)
+                await asyncio.sleep(15)
+
+        await send_telegram(
+            "🏠 <b>Home checker is online.</b>\n\n"
+            "Watching Little Things, Otakume, Pinca, Toybox and ELC from the home connection.", client)
+        await asyncio.gather(run_group(quick), run_group(others), alarm_loop())
+
+
 async def main() -> None:
     log.info("=" * 60)
     log.info("UAE Pokemon TCG Monitor — Starting")
@@ -5896,6 +6012,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(home_main() if MONITOR_ROLE == "home" else main())
     except KeyboardInterrupt:
         pass  # clean exit, no traceback
