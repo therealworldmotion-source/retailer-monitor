@@ -1272,6 +1272,89 @@ async def check_virgin_sitemap(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+# ─── LITTLE THINGS — SHOPIFY CLIENT (curl_cffi, mirrors Kinokuniya) ───────────
+#
+# Shopify's edge refuses Railway's shared datacenter IP with HTTP 429/403 on
+# plain-httpx requests — the exact reason Little Things, Toybox, Pinca and
+# Otakume were paused on 9 Oct 2026 (see PAUSED_RETAILERS). Kinokuniya survives
+# on the same edge because it fetches with curl_cffi impersonating a real
+# browser rather than httpx. Every Little Things checker now does the same:
+# a shared curl_cffi session with safari17_0 impersonation, minimal headers
+# (no User-Agent override — the impersonation supplies a matching one), and a
+# shared 403/429 slow-down log. Mirrors KINO_HDR / _kino_product /
+# _kino_note_status.
+
+LT_BASE = "https://littlethingsme.com"
+LT_HDR  = {"Referer": f"{LT_BASE}/", "Accept-Language": "en-US,en;q=0.9"}
+# Store-wide newest-published feed (mirrors KINO_FEED_URL): /products.json is
+# sorted by published_at descending, so a newly published TCG product filed
+# OUTSIDE the pokemon-tcg collection still lands at the top of this feed.
+LT_FEED_URL = LT_BASE + "/products.json?limit=50"
+LT_SLOW_INTERVAL = 60
+LT_SLOW_FOR      = 600
+_LT = {"slow_until": 0.0, "cf": None}
+
+
+def _lt_note_status(code: int, what: str) -> None:
+    """Shared 403/429 slow-down log, mirroring _kino_note_status."""
+    if code in (403, 429):
+        if time.time() >= _LT["slow_until"]:
+            log.warning("Little Things: HTTP %s on %s — slowing to %ds for %d min",
+                        code, what, LT_SLOW_INTERVAL, LT_SLOW_FOR // 60)
+        _LT["slow_until"] = time.time() + LT_SLOW_FOR
+
+
+def _lt_slowed() -> bool:
+    return time.time() < _LT["slow_until"]
+
+
+async def _shopify_get(url: str, *, referer: str, timeout: float = 25):
+    """GET through the shared curl_cffi impersonated session (mirrors Kinokuniya).
+    Returns the curl_cffi Response — callers use .status_code / .content / .text / .json()."""
+    if _LT["cf"] is None:
+        from curl_cffi.requests import AsyncSession
+        _LT["cf"] = AsyncSession(impersonate="safari17_0")
+    hdr = {"Referer": referer, "Accept-Language": "en-US,en;q=0.9"}
+    r = await _LT["cf"].get(url, headers=hdr, timeout=timeout)
+    if r.status_code in (403, 429):
+        _lt_note_status(r.status_code, url)
+    return r
+
+
+async def _lt_fetch(url: str, *, timeout: float = 25):
+    """Little Things GET — Little Things referer, curl_cffi impersonated."""
+    return await _shopify_get(url, referer=f"{LT_BASE}/", timeout=timeout)
+
+
+def _lt_is_tcg(title: str) -> bool:
+    """Pokemon TCG product — 'pokemon'/'pikachu' plus a card-product word, so
+    plushes/figures/books found outside the collection stay out."""
+    if not is_pokemon_title(title):
+        return False
+    return any(h in strip_accents(title) for h in LT_TCG_HINTS)
+
+
+def _lt_is_onepiece_tcg(title: str) -> bool:
+    tl = strip_accents(title)
+    if "one piece" not in tl and "one-piece" not in tl:
+        return False
+    return any(h in tl for h in LT_TCG_HINTS)
+
+
+def _lt_from_feed(fp: dict) -> dict:
+    """Little Things product entry shape, from a /products.json item (same field
+    convention as the existing collection parser)."""
+    vs = fp.get("variants") or [{}]
+    av = next((v for v in vs if v.get("available")), vs[0])
+    return {
+        "title":      fp.get("title") or "",
+        "url":        f"{LT_BASE}/products/{fp.get('handle')}",
+        "price":      f"AED {vs[0].get('price', '0')}",
+        "available":  any(v.get("available") for v in vs),
+        "variant_id": av.get("id"),
+    }
+
+
 # ─── LITTLE THINGS — BACKEND WATCH (whole store + staging collections) ────────
 #
 # The 30s collection checker only sees /collections/pokemon-tcg. This watches
@@ -1311,7 +1394,6 @@ def _lt_backend_term(slug: str) -> str | None:
 
 async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> dict:
     log.info("Checking Little Things backend (collections + sitemap tail)...")
-    hdr = get_json_headers()
     try:
         await asyncio.sleep(random.uniform(1, 3))
 
@@ -1319,7 +1401,7 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
         cols: dict[str, dict] = {}
         page = 1
         while page <= 5:
-            r = await client.get(f"{URLS['littlethings_collections']}&page={page}", headers=hdr, timeout=25)
+            r = await _lt_fetch(f"{URLS['littlethings_collections']}&page={page}", timeout=25)
             if r.status_code != 200:
                 log.warning("LT backend: collections HTTP %s on page %d — skipping pass", r.status_code, page)
                 return state
@@ -1334,7 +1416,7 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
             await asyncio.sleep(random.uniform(0.8, 1.5))
 
         # ── 2. product sitemap tail ──────────────────────────────────────
-        r = await client.get(URLS["littlethings_sitemap_index"], headers=get_headers("https://littlethingsme.com/"), timeout=30)
+        r = await _lt_fetch(URLS["littlethings_sitemap_index"], timeout=30)
         if r.status_code != 200:
             log.warning("LT backend: sitemap index HTTP %s — skipping pass", r.status_code)
             return state
@@ -1352,7 +1434,7 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
         handles: dict[str, str] = {}   # handle -> product url
         for f in tail:
             await asyncio.sleep(random.uniform(0.8, 1.5))
-            rr = await client.get(f, headers=get_headers("https://littlethingsme.com/"), timeout=60)
+            rr = await _lt_fetch(f, timeout=60)
             if rr.status_code != 200:
                 log.warning("LT backend: sitemap %s HTTP %s — skipping pass", f[-40:], rr.status_code)
                 return state
@@ -1372,8 +1454,8 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
         # ── 3. suggest.json cross-check for anniversary items ───────────
         try:
             await asyncio.sleep(random.uniform(0.5, 1.0))
-            rs = await client.get("https://littlethingsme.com/search/suggest.json?q=30th+anniversary&resources[type]=product&resources[limit]=10",
-                                  headers=hdr, timeout=20)
+            rs = await _lt_fetch("https://littlethingsme.com/search/suggest.json?q=30th+anniversary&resources[type]=product&resources[limit]=10",
+                                 timeout=20)
             if rs.status_code == 200:
                 for p in json.loads(rs.content).get("resources", {}).get("results", {}).get("products", []):
                     h = p.get("handle", "")
@@ -1407,7 +1489,7 @@ async def check_littlethings_backend(state: dict, client: httpx.AsyncClient) -> 
                         "available": True, "variant_id": None, "term": _lt_backend_term(h)}
                 try:
                     await asyncio.sleep(random.uniform(0.6, 1.2))
-                    rj = await client.get(f"https://littlethingsme.com/products/{h}.js", headers=hdr, timeout=20)
+                    rj = await _lt_fetch(f"https://littlethingsme.com/products/{h}.js", timeout=20)
                     if rj.status_code == 200:
                         pj = json.loads(rj.content)
                         info["title"] = pj.get("title") or info["title"]
@@ -3937,7 +4019,7 @@ async def check_shopify_suggest_lorcana(state: dict, client: httpx.AsyncClient, 
     try:
         await asyncio.sleep(random.uniform(1, 3))
         url = f"https://{domain}/search/suggest.json?q=lorcana&resources[type]=product&resources[limit]=10"
-        resp = await client.get(url, headers=get_json_headers(), timeout=20)
+        resp = await _shopify_get(url, referer=f"https://{domain}/", timeout=20)
         if resp.status_code != 200:
             log.warning("%s Lorcana: HTTP %s", state_key, resp.status_code); return state
         prods = (json.loads(resp.content).get("resources", {}).get("results", {}).get("products", []))
@@ -4597,7 +4679,7 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
         page_num = 1
         while True:
             url = f"{URLS['little_things']}&page={page_num}" if page_num > 1 else URLS["little_things"]
-            resp = await client.get(url, headers=get_json_headers(), timeout=25)
+            resp = await _lt_fetch(url, timeout=25)
             if resp.status_code != 200:
                 log.warning("Little Things: HTTP %s on page %d", resp.status_code, page_num)
                 return state
@@ -4636,6 +4718,19 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
             page_num += 1
             await asyncio.sleep(random.uniform(1, 2))
 
+        # Newest-published store-wide feed (mirrors Kinokuniya's KINO_FEED_URL):
+        # a TCG product filed outside the pokemon-tcg collection — or a brand-new
+        # listing — appears at the top of /products.json before it is searchable.
+        try:
+            fr = await _lt_fetch(LT_FEED_URL, timeout=30)
+            if fr.status_code == 200:
+                for fp in json.loads(fr.content).get("products", []):
+                    h = fp.get("handle")
+                    if h and h not in current and _lt_is_tcg(fp.get("title", "")):
+                        current[h] = _lt_from_feed(fp)
+        except Exception as exc:
+            log.warning("Little Things: newest feed failed: %s", exc)
+
         # Supplement the collection with Shopify search (plain + accented
         # 'Pokémon') to catch Pokemon products filed OUTSIDE the pokemon-tcg
         # collection. suggest.json lacks variant IDs, so search-only items get
@@ -4659,7 +4754,7 @@ async def check_little_things(state: dict, client: httpx.AsyncClient) -> dict:
                     "https://littlethingsme.com/search/suggest.json"
                     f"?q={q}&resources[type]=product&resources[limit]=10"
                 )
-                sresp = await client.get(surl, headers=get_json_headers(), timeout=20)
+                sresp = await _lt_fetch(surl, timeout=20)
                 if sresp.status_code != 200:
                     log.warning("Little Things search q=%s: HTTP %s", q, sresp.status_code)
                     continue
@@ -4869,7 +4964,7 @@ async def check_lt_30th(state: dict, client: httpx.AsyncClient) -> tuple[dict, b
     if time.time() < _LT30["backoff_until"]:
         return state, False
     try:
-        resp = await client.get(LT_30TH_URL, headers=get_json_headers(), timeout=15)
+        resp = await _lt_fetch(LT_30TH_URL, timeout=15)
     except Exception as exc:
         log.warning("LT 30th: fetch failed: %s", exc)
         return state, False
@@ -4966,7 +5061,7 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
         page_num = 1
         while True:
             url = f"{URLS['little_things_onepiece']}&page={page_num}" if page_num > 1 else URLS["little_things_onepiece"]
-            resp = await client.get(url, headers=get_json_headers(), timeout=25)
+            resp = await _lt_fetch(url, timeout=25)
             if resp.status_code != 200:
                 log.warning("Little Things OP: HTTP %s on page %d", resp.status_code, page_num)
                 return state
@@ -5001,6 +5096,19 @@ async def check_little_things_onepiece(state: dict, client: httpx.AsyncClient) -
                 break
             page_num += 1
             await asyncio.sleep(random.uniform(1, 2))
+
+        # Newest-published store-wide feed (mirrors Kinokuniya's KINO_FEED_URL):
+        # a One Piece TCG product filed outside the one-piece-tcg collection — or
+        # a brand-new listing — appears at the top of /products.json early.
+        try:
+            fr = await _lt_fetch(LT_FEED_URL, timeout=30)
+            if fr.status_code == 200:
+                for fp in json.loads(fr.content).get("products", []):
+                    h = fp.get("handle")
+                    if h and h not in current and _lt_is_onepiece_tcg(fp.get("title", "")):
+                        current[h] = _lt_from_feed(fp)
+        except Exception as exc:
+            log.warning("Little Things OP: newest feed failed: %s", exc)
 
         if not current:
             log.warning("Little Things OP: no One Piece products found")
@@ -5820,7 +5928,7 @@ class BackoffTransport(httpx.AsyncBaseTransport):
 # boot (recorded in state), uses a plain client WITHOUT the back-off layer so
 # nothing is masked, logs "PROBE" lines, and never alerts. ~25 requests.
 
-PROBE_ID = "2026-10-10b-singapore"   # re-run after moving the service to asia-southeast1
+PROBE_ID = "2026-10-17-cffi-probe"   # tests curl_cffi safari17_0 against the paused Shopify stores
 _PROBE_HDRS = ("retry-after", "server", "cf-ray", "cf-mitigated", "cf-cache-status", "x-request-id",
                "shopify-complexity-score", "shopify-complexity-score-v2", "x-dc", "content-type")
 
@@ -5854,6 +5962,36 @@ async def run_block_probe(state: dict) -> None:
                 log.info("PROBE egress: ip=%s org=%s city=%s country=%s", ip.get("ip"), ip.get("org"), ip.get("city"), ip.get("country"))
             except Exception as exc:
                 log.info("PROBE egress lookup failed: %s", type(exc).__name__)
+
+            # ── step D (run FIRST, clean): curl_cffi safari17_0 ──────────────
+            # The plain-client steps confirmed the block; this tests whether
+            # curl_cffi impersonation (the Kinokuniya transport) gets the SAME
+            # stores through from Railway — the question that decides whether the
+            # Little Things curl_cffi migration can be unpaused. Runs before any
+            # plain-client 429 so nothing is pre-tainted.
+            log.info("PROBE step D: curl_cffi safari17_0 against the paused Shopify stores")
+            try:
+                from curl_cffi.requests import AsyncSession
+                async with AsyncSession(impersonate="safari17_0") as cf:
+                    async def cffi_hit(label: str, url: str, site: str) -> int:
+                        hdr = {"Referer": f"https://{site}/", "Accept-Language": "en-US,en;q=0.9"}
+                        try:
+                            r = await cf.get(url, headers=hdr, timeout=30)
+                        except Exception as exc:
+                            log.info("PROBE-CFFI %-28s ERR %s", label, type(exc).__name__)
+                            return -1
+                        log.info("PROBE-CFFI %-28s HTTP %s", label, r.status_code)
+                        return r.status_code
+
+                    await cffi_hit("D LT collection feed", "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250", "littlethingsme.com")
+                    await asyncio.sleep(3); await cffi_hit("D LT newest feed", "https://littlethingsme.com/products.json?limit=50", "littlethingsme.com")
+                    await asyncio.sleep(3); await cffi_hit("D LT suggest", "https://littlethingsme.com/search/suggest.json?q=pokemon&resources[type]=product&resources[limit]=10", "littlethingsme.com")
+                    await asyncio.sleep(3); await cffi_hit("D Pinca feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250", "pinca.ae")
+                    await asyncio.sleep(3); await cffi_hit("D Toybox feed", "https://toybox.ae/collections/pokemon/products.json?limit=250", "toybox.ae")
+                    await asyncio.sleep(3); await cffi_hit("D Otakume collection", "https://otakume.com/collections/pokemon", "otakume.com")
+                    await asyncio.sleep(3); await cffi_hit("D ELC search", "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product", "elctoys.com")
+            except Exception as exc:
+                log.error("PROBE-CFFI failed: %s: %s", type(exc).__name__, exc)
             log.info("PROBE step A (%s): first request to each store", PROBE_ID)
             await hit("A LT collection feed", lt)
             await asyncio.sleep(4); await hit("A Pinca collection feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250")
