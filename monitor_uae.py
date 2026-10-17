@@ -79,16 +79,21 @@ ALWAYS_DISABLED = {"legends_own_the_game", "legends_onepiece", "legends_lorcana"
 # paused is the five Shopify stores Shopify's edge refuses from Railway
 # (probed again from a brand-new Singapore address: refused on the first
 # request), plus ZGames, which was already off before this.
+# 17 Oct 2026: Little Things (all five watchers) was migrated to curl_cffi
+# safari17_0 and unpaused — the block probe proved curl_cffi returns 200 from
+# Railway's Singapore IP for littlethingsme.com while plain httpx still 429s on
+# the same IP. What stays paused is the OTHER Shopify stores whose checkers
+# still use plain httpx (Otakume, Pinca, Toybox, ELC) plus ZGames.
 PAUSED_RETAILERS = {
-    "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
     "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
-    "little_things_lorcana", "otakume_lorcana",
+    "otakume_lorcana",
     "zgames",
 }
 # Running: amazon_ae, amazon_onepiece, kinokuniya, kinokuniya_lorcana,
-# virgin_megastore, virgin_megastore_onepiece, virgin_sitemap, colorland_toys,
-# magrudy, toycorner, dabdoob, and the Virgin/Magrudy/Colorland/ToyCorner
-# Lorcana watchers.
+# little_things, little_things_onepiece, lt_30th, littlethings_backend,
+# little_things_lorcana, virgin_megastore, virgin_megastore_onepiece,
+# virgin_sitemap, colorland_toys, magrudy, toycorner, dabdoob, and the
+# Virgin/Magrudy/Colorland/ToyCorner Lorcana watchers.
 
 # MONITOR_ROLE=home is the slim runner for a machine on a home connection (the
 # spare Surface). It runs ONLY the Shopify-hosted stores that Shopify's edge
@@ -97,9 +102,8 @@ PAUSED_RETAILERS = {
 # command listener, and has these stores paused. See home_main().
 MONITOR_ROLE   = os.environ.get("MONITOR_ROLE", "cloud").strip().lower()
 HOME_RETAILERS = {
-    "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
     "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
-    "little_things_lorcana", "otakume_lorcana",
+    "otakume_lorcana",
 }
 
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
@@ -6035,20 +6039,14 @@ async def home_main() -> None:
     log.info("Home checker starting (MONITOR_ROLE=home) — %s", ", ".join(sorted(HOME_RETAILERS)))
     log.info("=" * 60)
     state = load_state()
-    quick = [      # Little Things on its own task, so the slower stores never delay it
-        ("little_things",          check_little_things,          lambda st: LT_MAIN_INTERVAL),
-        ("little_things_onepiece", check_little_things_onepiece, lambda st: LT_OP_INTERVAL),
-        ("lt_30th",                check_lt_30th,
-         lambda st: LT_30TH_INTERVAL if st.get("lt_30th") else LT_30TH_EMPTY_INTERVAL),
-    ]
+    # Little Things moved to Railway on 17 Oct 2026 (curl_cffi); the home
+    # runner now covers only the Shopify stores still on plain httpx.
     others = [
         ("pinca",                 check_pinca,                 lambda st: 120),
         ("toybox",                check_toybox,                lambda st: 120),
         ("otakume",               check_otakume,               lambda st: 120),
         ("otakume_onepiece",      check_otakume_onepiece,      lambda st: 180),
         ("elctoys",               check_elctoys,               lambda st: 120),
-        ("littlethings_backend",  check_littlethings_backend,  lambda st: 600),
-        ("little_things_lorcana", check_little_things_lorcana, lambda st: 120),
         ("otakume_lorcana",       check_otakume_lorcana,       lambda st: 120),
     ]
     health: dict[str, dict] = {}
@@ -6109,8 +6107,8 @@ async def home_main() -> None:
 
         await send_telegram(
             "🏠 <b>Home checker is online.</b>\n\n"
-            "Watching Little Things, Otakume, Pinca, Toybox and ELC from the home connection.", client)
-        await asyncio.gather(run_group(quick), run_group(others), alarm_loop())
+            "Watching Otakume, Pinca, Toybox and ELC from the home connection.", client)
+        await asyncio.gather(run_group(others), alarm_loop())
 
 
 async def main() -> None:
