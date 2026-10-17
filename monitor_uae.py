@@ -79,32 +79,29 @@ ALWAYS_DISABLED = {"legends_own_the_game", "legends_onepiece", "legends_lorcana"
 # paused is the five Shopify stores Shopify's edge refuses from Railway
 # (probed again from a brand-new Singapore address: refused on the first
 # request), plus ZGames, which was already off before this.
-# 17 Oct 2026: Little Things (all five watchers) was migrated to curl_cffi
-# safari17_0 and unpaused — the block probe proved curl_cffi returns 200 from
-# Railway's Singapore IP for littlethingsme.com while plain httpx still 429s on
-# the same IP. What stays paused is the OTHER Shopify stores whose checkers
-# still use plain httpx (Otakume, Pinca, Toybox, ELC) plus ZGames.
+# 17 Oct 2026: every Shopify store was migrated to curl_cffi safari17_0 and
+# unpaused — the block probe proved curl_cffi returns 200 from Railway's
+# Singapore IP for littlethingsme.com, pinca.ae, toybox.ae, otakume.com and
+# elctoys.com while plain httpx still 429s on the same IP. Only ZGames stays
+# paused (Cloudflare blocks datacenter IPs; needs a residential proxy).
 PAUSED_RETAILERS = {
-    "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
-    "otakume_lorcana",
     "zgames",
 }
 # Running: amazon_ae, amazon_onepiece, kinokuniya, kinokuniya_lorcana,
 # little_things, little_things_onepiece, lt_30th, littlethings_backend,
-# little_things_lorcana, virgin_megastore, virgin_megastore_onepiece,
-# virgin_sitemap, colorland_toys, magrudy, toycorner, dabdoob, and the
+# little_things_lorcana, otakume, otakume_onepiece, otakume_lorcana, pinca,
+# toybox, elctoys, virgin_megastore, virgin_megastore_onepiece, virgin_sitemap,
+# colorland_toys, magrudy, toycorner, dabdoob, and the
 # Virgin/Magrudy/Colorland/ToyCorner Lorcana watchers.
 
 # MONITOR_ROLE=home is the slim runner for a machine on a home connection (the
-# spare Surface). It runs ONLY the Shopify-hosted stores that Shopify's edge
-# refuses from Railway, with the same honest plain client, and sends alerts
-# through the same bot. Railway ("cloud") keeps everything else, the Telegram
-# command listener, and has these stores paused. See home_main().
+# spare Surface). Retired 17 Oct 2026: every Shopify store now runs on Railway
+# via curl_cffi, so home has nothing left to watch. Kept for completeness; see
+# home_main(). Railway ("cloud") runs everything plus the Telegram listener.
 MONITOR_ROLE   = os.environ.get("MONITOR_ROLE", "cloud").strip().lower()
-HOME_RETAILERS = {
-    "otakume", "otakume_onepiece", "pinca", "toybox", "elctoys",
-    "otakume_lorcana",
-}
+# Home retired 17 Oct 2026 — every Shopify store now runs on Railway via
+# curl_cffi, so the home runner has nothing left to watch.
+HOME_RETAILERS = set()
 
 # Retailers the user can disable via env (comma-separated keys: geekay,otakume,...).
 DISABLED_RETAILERS = {
@@ -6027,16 +6024,9 @@ async def home_main() -> None:
     log.info("Home checker starting (MONITOR_ROLE=home) — %s", ", ".join(sorted(HOME_RETAILERS)))
     log.info("=" * 60)
     state = load_state()
-    # Little Things moved to Railway on 17 Oct 2026 (curl_cffi); the home
-    # runner now covers only the Shopify stores still on plain httpx.
-    others = [
-        ("pinca",                 check_pinca,                 lambda st: 120),
-        ("toybox",                check_toybox,                lambda st: 120),
-        ("otakume",               check_otakume,               lambda st: 120),
-        ("otakume_onepiece",      check_otakume_onepiece,      lambda st: 180),
-        ("elctoys",               check_elctoys,               lambda st: 120),
-        ("otakume_lorcana",       check_otakume_lorcana,       lambda st: 120),
-    ]
+    # Home retired 17 Oct 2026 — every Shopify store now runs on Railway via
+    # curl_cffi. Kept as a stub so MONITOR_ROLE=home still boots cleanly.
+    others = []
     health: dict[str, dict] = {}
 
     async with httpx.AsyncClient(
