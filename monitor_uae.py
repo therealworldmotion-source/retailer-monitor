@@ -799,15 +799,7 @@ async def check_otakume(state: dict, client: httpx.AsyncClient) -> dict:
 
             resp = None
             for attempt in range(2):  # one retry on transient 5xx
-                resp = await client.get(
-                    page_url,
-                    headers={
-                        "User-Agent": random.choice(USER_AGENTS),
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-GB,en;q=0.9",
-                    },
-                    timeout=25,
-                )
+                resp = await _shopify_get(page_url, referer="https://otakume.com/", timeout=25, label="Otakume")
                 if resp.status_code == 200 or resp.status_code < 500:
                     break
                 await asyncio.sleep(random.uniform(4, 7))
@@ -1299,12 +1291,12 @@ LT_SLOW_FOR      = 600
 _LT = {"slow_until": 0.0, "cf": None}
 
 
-def _lt_note_status(code: int, what: str) -> None:
+def _shopify_note_status(code: int, what: str, label: str = "Shopify") -> None:
     """Shared 403/429 slow-down log, mirroring _kino_note_status."""
     if code in (403, 429):
         if time.time() >= _LT["slow_until"]:
-            log.warning("Little Things: HTTP %s on %s — slowing to %ds for %d min",
-                        code, what, LT_SLOW_INTERVAL, LT_SLOW_FOR // 60)
+            log.warning("%s: HTTP %s on %s — slowing to %ds for %d min",
+                        label, code, what, LT_SLOW_INTERVAL, LT_SLOW_FOR // 60)
         _LT["slow_until"] = time.time() + LT_SLOW_FOR
 
 
@@ -1312,7 +1304,7 @@ def _lt_slowed() -> bool:
     return time.time() < _LT["slow_until"]
 
 
-async def _shopify_get(url: str, *, referer: str, timeout: float = 25):
+async def _shopify_get(url: str, *, referer: str, timeout: float = 25, label: str = "Shopify"):
     """GET through the shared curl_cffi impersonated session (mirrors Kinokuniya).
     Returns the curl_cffi Response — callers use .status_code / .content / .text / .json()."""
     if _LT["cf"] is None:
@@ -1321,13 +1313,13 @@ async def _shopify_get(url: str, *, referer: str, timeout: float = 25):
     hdr = {"Referer": referer, "Accept-Language": "en-US,en;q=0.9"}
     r = await _LT["cf"].get(url, headers=hdr, timeout=timeout)
     if r.status_code in (403, 429):
-        _lt_note_status(r.status_code, url)
+        _shopify_note_status(r.status_code, url, label)
     return r
 
 
 async def _lt_fetch(url: str, *, timeout: float = 25):
     """Little Things GET — Little Things referer, curl_cffi impersonated."""
-    return await _shopify_get(url, referer=f"{LT_BASE}/", timeout=timeout)
+    return await _shopify_get(url, referer=f"{LT_BASE}/", timeout=timeout, label="Little Things")
 
 
 def _lt_is_tcg(title: str) -> bool:
@@ -1902,7 +1894,7 @@ async def _etb_still_live(client: httpx.AsyncClient, url: str):
     if _etb_host(url) not in ETB_ALARM_SHOPIFY_HOSTS or "/products/" not in url:
         return None
     try:
-        r = await client.get(url + ".js", headers=get_json_headers(), timeout=15)
+        r = await _shopify_get(url + ".js", referer=f"https://{_etb_host(url)}/", timeout=15, label="ETB alarm")
     except Exception:
         return None
     if r.status_code == 404:
@@ -2012,7 +2004,7 @@ async def check_shopify_collection(
         page = 1
         while page <= 5:
             url = base if page == 1 else f"{base}&page={page}"
-            resp = await client.get(url, headers=get_json_headers(), timeout=25)
+            resp = await _shopify_get(url, referer=f"https://{host}/", timeout=25, label=log_name)
             if resp.status_code != 200:
                 log.warning("%s: HTTP %s on page %d — skipping state update",
                             log_name, resp.status_code, page)
@@ -2230,7 +2222,7 @@ async def check_otakume_onepiece(state: dict, client: httpx.AsyncClient) -> dict
         page = 1
         while page <= 3:
             url = f"https://otakume.com/collections/one-piece/products.json?limit=250&page={page}"
-            r = await client.get(url, headers=get_json_headers(), timeout=25)
+            r = await _shopify_get(url, referer="https://otakume.com/", timeout=25, label="Otakume OP")
             if r.status_code != 200:
                 log.warning("Otakume One Piece: HTTP %s", r.status_code)
                 if page == 1:
@@ -4167,15 +4159,11 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
             page_num = 1
             while page_num <= 8:  # safety cap
                 url = base if page_num == 1 else f"{base}&page={page_num}"
-                resp = await client.get(
-                    url,
-                    headers=get_headers("https://elctoys.com/"),
-                    timeout=25,
-                )
+                resp = await _shopify_get(url, referer="https://elctoys.com/", timeout=25, label="ELC Toys")
                 if resp.status_code == 429:
                     log.warning("ELC Toys: rate limited on page %d — waiting 30s", page_num)
                     await asyncio.sleep(30)
-                    resp = await client.get(url, headers=get_headers("https://elctoys.com/"), timeout=25)
+                    resp = await _shopify_get(url, referer="https://elctoys.com/", timeout=25, label="ELC Toys")
                 if resp.status_code != 200:
                     log.warning("ELC Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
                     fetch_error = True
