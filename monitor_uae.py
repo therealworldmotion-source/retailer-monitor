@@ -2123,8 +2123,81 @@ async def check_pinca(state: dict, client: httpx.AsyncClient) -> dict:
 
 
 async def check_toybox(state: dict, client: httpx.AsyncClient) -> dict:
-    return await check_shopify_collection(state, client, key="toybox", host="toybox.ae",
-                                          headline="🧸 TOYBOX", log_name="Toybox")
+    """Toybox — Shopify. Its "pokemon" collection now holds only a MetaZoo box;
+    the handful of Pokemon TCG listings (currently out of stock) are only
+    reachable via search. Watch them through suggest.json and alert on restocks."""
+    log.info("Checking Toybox...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        for q in ("pokemon", "pokémon", "tcg"):
+            url = f"https://toybox.ae/search/suggest.json?q={q}&resources[type]=product&resources[limit]=20"
+            r = await _shopify_get(url, referer="https://toybox.ae/", timeout=20, label="Toybox")
+            if r.status_code != 200:
+                log.warning("Toybox: search q=%s HTTP %s", q, r.status_code)
+                continue
+            try:
+                prods = r.json().get("resources", {}).get("results", {}).get("products", [])
+            except Exception:
+                continue
+            for p in prods:
+                title = p.get("title", "")
+                handle = p.get("handle", "")
+                if not handle or not is_pokemon_title(title) or title_excluded(title):
+                    continue
+                current[handle] = {
+                    "title": title,
+                    "url": f"https://toybox.ae/products/{handle}",
+                    "price": f"AED {p.get('price', '0')}",
+                    "available": bool(p.get("available")),
+                    "variant_id": None,   # suggest.json omits variants
+                }
+
+        if not current:
+            log.warning("Toybox: no Pokemon TCG products found via search")
+            return state
+
+        mark_ok(state, "toybox")
+        log.info("Toybox: %d Pokemon TCG product(s), %d in stock",
+                 len(current), sum(1 for v in current.values() if v["available"]))
+
+        prev = state.get("toybox") or {}
+        first_run = not prev
+        if first_run:
+            in_stock = [v for v in current.values() if v["available"]]
+            lines = [f"<b>🧸 TOYBOX — Monitoring Started ({len(current)} products)</b>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                lines += [fmt_product(v) for v in in_stock[:20]]
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("Toybox: baseline sent (%d products)", len(current))
+        else:
+            new_products = [p for h, p in current.items() if h not in prev]
+            restocked = [p for h, p in current.items() if h in prev and p["available"] and not prev[h].get("available")]
+            went_oos = [p for h, p in current.items() if h in prev and not p["available"] and prev[h].get("available")]
+            if new_products:
+                lines = [f"<b>🆕 TOYBOX — {len(new_products)} New Product(s)!</b>"]
+                lines += [fmt_product(p) for p in new_products]
+                await send_telegram("\n".join(lines), client)
+                log_events("toybox", "new", new_products)
+            if restocked:
+                lines = ["<b>🟢 TOYBOX — Back In Stock!</b>"]
+                lines += [fmt_product(p, "✅") for p in restocked]
+                await send_telegram("\n".join(lines), client)
+                log_events("toybox", "restock", restocked)
+            if went_oos:
+                log.info("Toybox: %d went OOS (not alerting)", len(went_oos))
+            await alert_price_changes("toybox", "🧸 TOYBOX", prev, current, client)
+            if not (new_products or restocked):
+                log.info("Toybox: no changes")
+
+        state["toybox"] = current
+    except Exception as exc:
+        log.error("Toybox check failed: %s", exc)
+    return state
 
 
 # ─── ONE PIECE TCG WATCHERS ───────────────────────────────────────────────────
@@ -2838,11 +2911,74 @@ async def check_legends_own_the_game(state: dict, client: httpx.AsyncClient) -> 
 
 # ─── COLORLAND TOYS (Shopify SSR) ─────────────────────────────────────────────
 
+COLORLAND_BLOCKLIST = {
+    # flap in/out of stock constantly, or aren't Pokemon TCG
+    "pokemon-my-partner-pikachu-pkw0030",
+    "vtech-paw-patrol-learning-watch-chase-80-551603",
+    "vtech-paw-patrol-learning-watch-marshall-80-551663",
+    "uno-dos-refresh-card-game-hnn01",
+    "uno-dos-card-game-frm36",
+}
+
+
+def _colorland_parse_cards(html: str) -> list[dict]:
+    """Colorland's new (Oct 2026) card layout: article[data-h] with data-vid
+    (variant), data-max (stock), a.name (title), .price strong. Returns dicts
+    with title/url/price/available/variant_id/stock."""
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for art in soup.select("article[data-h]"):
+        handle = (art.get("data-h") or "").strip()
+        if not handle:
+            continue
+        vid = (art.get("data-vid") or "").strip() or None
+        stock = None
+        raw = art.get("data-max")
+        if raw not in (None, ""):
+            try:
+                stock = int(raw)
+            except Exception:
+                stock = None
+        title_el = art.select_one("a.name")
+        title = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
+        if not title or len(title) < 3:
+            continue
+        price_el = art.select_one(".price strong") or art.select_one(".price")
+        price = price_el.get_text(strip=True) if price_el else "N/A"
+        out.append({
+            "title": title,
+            "url": f"https://colorlandtoys.com/products/{handle}",
+            "price": price,
+            "available": (stock is None) or (stock > 0),
+            "variant_id": vid,
+            "stock": stock,
+        })
+    return out
+
+
+def _colorland_alert_line(prod: dict, status_icon: str = "") -> str:
+    line = fmt_product(prod, status_icon)
+    if prod.get("stock") is not None:
+        line += f"  <i>({prod['stock']} left)</i>"
+    if prod.get("variant_id"):
+        line += f'\n     🛒 <a href="https://colorlandtoys.com/cart/add?id={prod["variant_id"]}&amp;quantity=1">ADD TO BASKET</a>'
+    return line
+
+
 async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
-    """Colorland Toys — Shopify store with server-rendered HTML.
-    Parses data-json-product attributes directly; no browser needed.
-    Paginates through all pages (50 per page)."""
+    """Colorland Toys — Shopify SSR. New card layout: article[data-h] with
+    data-vid / data-max, a.name, .price strong. Sold-out items are dropped from
+    search, so the two-miss rule treats a vanish as sold-out and a return as a
+    restock."""
     log.info("Checking Colorland Toys...")
+
+    # One-time re-baseline after the reader changed: discard old-format state so
+    # the first check sends one summary, not a diff flood against stale entries.
+    if not state.get("_colorland_card_reader_v2"):
+        state["_colorland_card_reader_v2"] = True
+        state["colorland_toys"] = {}
+        state["_colorland_startup_sent"] = False
+
     current: dict[str, dict] = {}
 
     try:
@@ -2850,148 +2986,86 @@ async def check_colorland_toys(state: dict, client: httpx.AsyncClient) -> dict:
         # Search both plain and accented spellings; merge by handle.
         colorland_bases = [URLS["colorland_toys"], URLS.get("colorland_toys_accented")]
         colorland_bases = [b for b in colorland_bases if b]
-        fetch_error = False
+        total_pages = 0
         for base in colorland_bases:
             page_num = 1
-            while True:
+            while page_num <= 15:  # safety cap
                 url = base if page_num == 1 else f"{base}&page={page_num}"
-                resp = await client.get(
-                    url,
-                    headers=get_headers("https://colorlandtoys.com/"),
-                    timeout=25,
-                )
+                resp = await client.get(url, headers=get_headers("https://colorlandtoys.com/"), timeout=25)
                 if resp.status_code == 429:
                     log.warning("Colorland Toys: rate limited on page %d — waiting 30s and retrying", page_num)
                     await asyncio.sleep(30)
                     resp = await client.get(url, headers=get_headers("https://colorlandtoys.com/"), timeout=25)
                 if resp.status_code != 200:
-                    log.warning("Colorland Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
-                    fetch_error = True
+                    log.warning("Colorland Toys: HTTP %s on page %d — stopping this search", resp.status_code, page_num)
                     break
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-                items = soup.select("div.product-item[data-json-product]")
-                log.info("Colorland Toys: page %d — %d items", page_num, len(items))
-
+                items = _colorland_parse_cards(resp.text)
                 if not items:
                     break
-
-                for item in items:
-                    try:
-                        data = json.loads(item["data-json-product"])
-                    except Exception:
+                for it in items:
+                    h = it["url"].rsplit("/products/", 1)[-1]
+                    if h in COLORLAND_BLOCKLIST:
                         continue
-
-                    handle = data.get("handle", "")
-                    if not handle:
+                    if not is_pokemon_title(it["title"]):
                         continue
-
-                    variants  = data.get("variants", [{}])
-                    v         = variants[0] if variants else {}
-                    available = bool(v.get("available", True))
-                    price_raw = v.get("price", 0)
-                    price     = f"AED {int(price_raw) // 100}" if price_raw else "N/A"
-
-                    # Title from HTML (not in JSON)
-                    title_el = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
-                    title    = title_el.get_text(strip=True) if title_el else handle.replace("-", " ").title()
-                    if not title or len(title) < 3:
-                        continue
-
-                    # Colorland's search uses options[prefix]=last, which is fuzzy
-                    # enough to return ~353 products (Uno, VTech Paw Patrol, board
-                    # games). Keep only Pokemon titles or the non-Pokemon items
-                    # flap in/out of stock and spam alerts.
-                    if not is_pokemon_title(title):
-                        continue
-
-                    prod_url = f"https://colorlandtoys.com/products/{handle}"
-                    current[handle] = {"title": title, "url": prod_url, "price": price, "available": available}
-
-                if len(items) < 50:
-                    break  # last page
+                    current[h] = it
+                total_pages += 1
                 page_num += 1
                 await asyncio.sleep(random.uniform(3, 6))
-
-            if fetch_error:
-                break
             await asyncio.sleep(random.uniform(2, 4))
-
-        if fetch_error:
-            log.warning("Colorland Toys: pagination error — state not updated")
-            return state
 
         if not current:
             log.warning("Colorland Toys: no products found — selectors may have changed")
             return state
 
-        log.info("Colorland Toys: %d products found across %d page(s)", len(current), page_num)
+        log.info("Colorland Toys: %d products found across %d page(s)", len(current), total_pages)
 
         mark_ok(state, "colorland_toys")
 
         prev      = state.get("colorland_toys", {})
         first_run = len(prev) == 0
 
-        COLORLAND_BLOCKLIST = {
-            "pokemon-my-partner-pikachu-pkw0030",
-            "vtech-paw-patrol-learning-watch-chase-80-551603",
-            "vtech-paw-patrol-learning-watch-marshall-80-551663",
-            # Uno DOS — flaps in/out of stock constantly, not Pokemon TCG anyway
-            "uno-dos-refresh-card-game-hnn01",
-            "uno-dos-card-game-frm36",
-        }
-
-        # Send startup summary on first check of each session
+        # One-shot summary (Started/Resumed) — no per-product alert flood.
         if first_run or not state.get("_colorland_startup_sent"):
-            in_stock  = [v for v in current.values() if v["available"]]
-            out_stock = [v for v in current.values() if not v["available"]]
+            in_stock = [v for v in current.values() if v["available"]]
             lines = [f"<b>🧩 COLORLAND TOYS — Monitoring {'Started' if first_run else 'Resumed'} ({len(current)} products)</b>"]
             if in_stock:
                 lines.append("\n✅ <b>In Stock:</b>")
-                for p in in_stock[:20]:
-                    lines.append(fmt_product(p))
-                if len(in_stock) > 20:
-                    lines.append(f"  ...and {len(in_stock) - 20} more in stock")
-            if out_stock:
-                lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)} product(s)")
+                for p in in_stock[:25]:
+                    lines.append(_colorland_alert_line(p))
+                if len(in_stock) > 25:
+                    lines.append(f"  ...and {len(in_stock) - 25} more in stock")
             await send_telegram("\n".join(lines), client)
             state["_colorland_startup_sent"] = True
             log.info("Colorland Toys: baseline sent (%d products)", len(current))
         else:
-            new_products, restocked, went_oos = [], [], []
-            for pid, prod in current.items():
-                if pid in COLORLAND_BLOCKLIST:
-                    continue
-                if pid not in prev:
-                    new_products.append(prod)
-                elif prod["available"] != prev[pid]["available"]:
-                    (restocked if prod["available"] else went_oos).append(prod)
-
+            new_products, restocked = [], []
+            for h, pd in current.items():
+                if h not in prev:
+                    new_products.append(pd)
+                elif pd["available"] and not prev[h].get("available"):
+                    restocked.append(pd)
             if new_products:
-                lines = [f"<b>🆕 COLORLAND TOYS — {len(new_products)} New Product(s)!</b>"]
-                for p in new_products:
-                    lines.append(fmt_product(p))
+                new_products.sort(key=lambda v: not v["available"])
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(new_products) else ""
+                lines = [f"<b>{tag}🆕 COLORLAND TOYS — {len(new_products)} New Product(s)!</b>"]
+                lines += [_colorland_alert_line(v) for v in new_products]
                 await send_telegram("\n".join(lines), client)
                 log_events("colorland_toys", "new", new_products)
             if restocked:
-                lines = ["<b>🟢 COLORLAND TOYS — Back In Stock!</b>"]
-                for p in restocked:
-                    lines.append(fmt_product(p, "✅"))
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(restocked) else ""
+                lines = [f"<b>{tag}🟢 COLORLAND TOYS — {len(restocked)} Back In Stock!</b>"]
+                lines += [_colorland_alert_line(v, "✅") for v in restocked]
                 await send_telegram("\n".join(lines), client)
                 log_events("colorland_toys", "restock", restocked)
-            if went_oos:
-                lines = ["<b>🔴 COLORLAND TOYS — Out of Stock</b>"]
-                for p in went_oos:
-                    lines.append(fmt_product(p, "❌"))
-                await send_telegram("\n".join(lines), client)
-                log_events("colorland_toys", "oos", went_oos)
             await alert_price_changes("colorland_toys", "🧩 COLORLAND TOYS", prev, current, client)
-            if not (new_products or restocked or went_oos):
+            if not (new_products or restocked):
                 log.info("Colorland Toys: no changes")
 
-        # Merge current into prev so flickering products don't re-alert
-        merged = state.get("colorland_toys", {})
-        merged.update(current)
+        # Two-miss rule: an item that vanishes from search (sold out) is kept one
+        # extra pass before being marked unavailable, so a flicker won't re-alert
+        # and a real return still shows as a restock.
+        merged, _ = _age_missing(prev, current)
         state["colorland_toys"] = merged
 
     except Exception as exc:
@@ -4059,26 +4133,21 @@ async def check_colorland_lorcana(state: dict, client: httpx.AsyncClient) -> dic
     current: dict[str, dict] = {}
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        resp = await client.get(URLS["colorland_lorcana"], headers=get_headers("https://colorlandtoys.com/"), timeout=25)
-        if resp.status_code != 200:
-            log.warning("Colorland Lorcana: HTTP %s", resp.status_code); return state
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for item in soup.select("div.product-item[data-json-product]"):
-            try:
-                data = json.loads(item["data-json-product"])
-            except Exception:
-                continue
-            handle = data.get("handle", "")
-            te = item.select_one("a.card-title span.text") or item.select_one("a.card-title")
-            title = te.get_text(strip=True) if te else handle.replace("-", " ").title()
-            if not handle or not _is_lorcana_product(title):
-                continue
-            v = (data.get("variants") or [{}])[0]
-            available = bool(v.get("available", True))
-            pr = v.get("price", 0)
-            price = f"AED {int(pr) // 100}" if pr else "N/A"
-            current[handle] = {"title": title, "url": f"https://colorlandtoys.com/products/{handle}",
-                               "price": price, "available": available}
+        for page in range(1, 4):
+            url = URLS["colorland_lorcana"] if page == 1 else f"{URLS['colorland_lorcana']}&page={page}"
+            resp = await client.get(url, headers=get_headers("https://colorlandtoys.com/"), timeout=25)
+            if resp.status_code != 200:
+                log.warning("Colorland Lorcana: HTTP %s on page %d", resp.status_code, page)
+                break
+            items = _colorland_parse_cards(resp.text)
+            if not items:
+                break
+            for it in items:
+                if not _is_lorcana_product(it["title"]):
+                    continue
+                h = it["url"].rsplit("/products/", 1)[-1]
+                current[h] = it
+            await asyncio.sleep(random.uniform(1, 2))
         await _lorcana_diff_and_alert(state, client, "colorland_lorcana", "🃏 COLORLAND (LORCANA)", current)
     except Exception as exc:
         log.error("Colorland Lorcana check failed: %s", exc)
@@ -4159,7 +4228,7 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
         await asyncio.sleep(random.uniform(1, 3))
         bases = [URLS["elctoys"], URLS.get("elctoys_accented")]
         bases = [b for b in bases if b]
-        fetch_error = False
+        partial = False
 
         for base in bases:
             page_num = 1
@@ -4171,8 +4240,11 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                     await asyncio.sleep(30)
                     resp = await _shopify_get(url, referer="https://elctoys.com/", timeout=25, label="ELC Toys")
                 if resp.status_code != 200:
-                    log.warning("ELC Toys: HTTP %s on page %d — skipping state update", resp.status_code, page_num)
-                    fetch_error = True
+                    # A 403/5xx on page 2+ shouldn't throw away page 1's good data —
+                    # keep what we have so far and mark the pass partial.
+                    log.warning("ELC Toys: HTTP %s on page %d — keeping %d product(s) so far",
+                                resp.status_code, page_num, len(current))
+                    partial = True
                     break
 
                 soup = BeautifulSoup(resp.text, "html.parser")
@@ -4247,13 +4319,8 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
                 page_num += 1
                 await asyncio.sleep(random.uniform(2, 4))
 
-            if fetch_error:
-                break
             await asyncio.sleep(random.uniform(1, 2))
 
-        if fetch_error:
-            log.warning("ELC Toys: fetch error — state not updated")
-            return state
         if not current:
             log.warning("ELC Toys: no Pokemon TCG products parsed")
             return state
@@ -4264,6 +4331,11 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
 
         prev      = state.get("elctoys", {})
         first_run = len(prev) == 0
+        # A partial first scrape would baseline on a fraction of the catalogue
+        # and re-announce the rest as "new" on the next clean pass.
+        if first_run and partial:
+            log.warning("ELC Toys: partial scrape on first run — deferring baseline")
+            return state
 
         def _cart_line(p: dict) -> str:
             if p.get("available") and p.get("variant_id"):
@@ -4318,15 +4390,22 @@ async def check_elctoys(state: dict, client: httpx.AsyncClient) -> dict:
             if not (new_products or restocked or went_oos):
                 log.info("ELC Toys: no changes")
 
-        merged, removed = _age_missing(state.get("elctoys") or {}, current)
-        if removed:
-            lines = [f"<b>🔴 ELC TOYS — {len(removed)} No Longer Listed</b>",
-                     "<i>Removed from the site while in stock. Links to them are dead; you'll be alerted if they return in stock.</i>"]
-            for p in removed:
-                lines.append(fmt_product(p, "❌"))
-            await send_telegram("\n".join(lines), client)
-            log.info("ELC Toys: %d product(s) no longer listed", len(removed))
-        state["elctoys"] = merged
+        if partial:
+            # A page 403'd, so "missing" products may just be on the unread page.
+            # Merge in place instead of aging them out (which would false-remove).
+            merged = dict(state.get("elctoys") or {})
+            merged.update(current)
+            state["elctoys"] = merged
+        else:
+            merged, removed = _age_missing(state.get("elctoys") or {}, current)
+            if removed:
+                lines = [f"<b>🔴 ELC TOYS — {len(removed)} No Longer Listed</b>",
+                         "<i>Removed from the site while in stock. Links to them are dead; you'll be alerted if they return in stock.</i>"]
+                for p in removed:
+                    lines.append(fmt_product(p, "❌"))
+                await send_telegram("\n".join(lines), client)
+                log.info("ELC Toys: %d product(s) no longer listed", len(removed))
+            state["elctoys"] = merged
 
     except Exception as exc:
         log.error("ELC Toys check failed: %s", exc)
@@ -5452,7 +5531,16 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
     FAIL_ALERTED: dict[str, bool] = {}    # whether we already sent an alert
     # Amazon throttles Railway's IP on and off all day, so its FAILING pings were
     # pure noise (7 in 5 h on 19 Sep 2026). Health still shows on the status board.
-    SILENT_FAIL_SITES = {"amazon_ae", "amazon_onepiece"}
+    # Shopify's Cloudflare rate-limits the datacenter IP the same way (Nov 2026),
+    # so every Shopify/curl_cffi checker gets the same treatment: log the failure,
+    # show ❌ on the board, but never Telegram-spam a transient 403/429.
+    SILENT_FAIL_SITES = {
+        "amazon_ae", "amazon_onepiece",
+        "little_things", "little_things_onepiece", "lt_30th", "littlethings_backend",
+        "little_things_lorcana", "otakume", "otakume_onepiece", "otakume_lorcana",
+        "pinca", "toybox", "elctoys", "kinokuniya", "kinokuniya_lorcana",
+        "cruncharcade",
+    }
 
     # A site that fails, gets one check through, then fails again used to ping
     # FAILING on every cycle (30 pings on 9 Oct). It now has to stay healthy
