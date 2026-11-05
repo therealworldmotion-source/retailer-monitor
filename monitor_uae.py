@@ -1287,11 +1287,11 @@ LT_HDR  = {"Referer": f"{LT_BASE}/", "Accept-Language": "en-US,en;q=0.9"}
 LT_FEED_URL = LT_BASE + "/products.json?limit=50"
 LT_SLOW_INTERVAL = 60
 LT_SLOW_FOR      = 600
-# Impersonation profile for every Shopify curl_cffi session. safari17_0 got
-# 403'd by Shopify's Cloudflare around 3-4 Nov 2026; override via env to swap
-# to a working profile without a code change.
-SHOPIFY_IMPERSONATE = os.environ.get("SHOPIFY_IMPERSONATE", "safari17_0")
-_LT = {"slow_until": 0.0, "cf": None}
+# Impersonation profiles to rotate across. Cloudflare 403s a single fixed
+# fingerprint under sustained polling from a datacenter IP, so round-robin
+# four known-good profiles (newer chrome136+/firefox/safari18+ are pre-blocked).
+SHOPIFY_PROFILES = ("safari17_0", "chrome124", "chrome131", "edge101")
+_LT = {"slow_until": 0.0, "cf": {}, "rot": 0}
 
 
 def _shopify_note_status(code: int, what: str, label: str = "Shopify") -> None:
@@ -1307,14 +1307,24 @@ def _lt_slowed() -> bool:
     return time.time() < _LT["slow_until"]
 
 
+def _shopify_impersonate() -> str:
+    """Next profile in the round-robin rotation."""
+    p = SHOPIFY_PROFILES[_LT["rot"] % len(SHOPIFY_PROFILES)]
+    _LT["rot"] += 1
+    return p
+
+
 async def _shopify_get(url: str, *, referer: str, timeout: float = 25, label: str = "Shopify"):
-    """GET through the shared curl_cffi impersonated session (mirrors Kinokuniya).
-    Returns the curl_cffi Response — callers use .status_code / .content / .text / .json()."""
-    if _LT["cf"] is None:
-        from curl_cffi.requests import AsyncSession
-        _LT["cf"] = AsyncSession(impersonate=SHOPIFY_IMPERSONATE)
+    """GET through a rotation of curl_cffi impersonated sessions (mirrors
+    Kinokuniya). Returns the curl_cffi Response — callers use .status_code /
+    .content / .text / .json()."""
+    from curl_cffi.requests import AsyncSession
+    profile = _shopify_impersonate()
+    cf = _LT["cf"].get(profile)
+    if cf is None:
+        cf = _LT["cf"][profile] = AsyncSession(impersonate=profile)
     hdr = {"Referer": referer, "Accept-Language": "en-US,en;q=0.9"}
-    r = await _LT["cf"].get(url, headers=hdr, timeout=timeout)
+    r = await cf.get(url, headers=hdr, timeout=timeout)
     if r.status_code in (403, 429):
         _shopify_note_status(r.status_code, url, label)
     return r
@@ -3431,7 +3441,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        async with AsyncSession(impersonate=SHOPIFY_IMPERSONATE) as cf:
+        async with AsyncSession(impersonate=_shopify_impersonate()) as cf:
             async def cards(url: str):
                 try:
                     r = await cf.get(url, headers=KINO_HDR, timeout=30)
@@ -3950,7 +3960,7 @@ async def check_kinokuniya_lorcana(state: dict, client: httpx.AsyncClient) -> di
     try:
         await asyncio.sleep(random.uniform(1, 3))
         ok = False
-        async with AsyncSession(impersonate=SHOPIFY_IMPERSONATE) as cf:
+        async with AsyncSession(impersonate=_shopify_impersonate()) as cf:
             for pg in range(1, 6):
                 r = await cf.get(f"{KINO_BASE}/search?q=lorcana&type=product&page={pg}", headers=KINO_HDR, timeout=30)
                 if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
