@@ -142,7 +142,7 @@ def _config_from_env() -> dict | None:
             "otakume": 120, "virgin_megastore": 60, "virgin_megastore_onepiece": 60, "legends_own_the_game": 60,
             "colorland_toys": 180, "magrudy": 60, "zgames": 60,
             "geekay": 120, "little_things": 30, "toycorner": 180,
-            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "onepiece": 180, "dabdoob": 600, "lorcana": 120,
+            "kinokuniya": 120, "kinokuniya_event": 120, "elctoys": 120, "virgin_sitemap": 600, "littlethings_backend": 600, "amazon_ae": 600, "pinca": 120, "toybox": 120, "onepiece": 180, "dabdoob": 600, "lorcana": 120, "cruncharcade": 120,
         },
         "urls": {
             "otakume": "https://otakume.com/collections/pokemon",
@@ -331,6 +331,7 @@ def load_state() -> dict:
         "legends_onepiece":     {},
         "amazon_onepiece":      {},
         "dabdoob":              {},
+        "cruncharcade":         {},
     }
 
 
@@ -396,6 +397,7 @@ RETAILER_LABELS = {
     "legends_onepiece":          "🏴\u200d☠️ Legends (OP)",
     "amazon_onepiece":           "🏴\u200d☠️ Amazon (OP)",
     "dabdoob":                   "🧸 Dabdoob",
+    "cruncharcade":              "🎮 Crunch Arcade",
     "colorland_toys":            "🧩 Colorland Toys",
     "toycorner":                 "🧸 Toy Corner",
     "otakume":                   "🟡 Otakume",
@@ -4658,6 +4660,137 @@ async def check_geekay(state: dict, client: httpx.AsyncClient) -> dict:
     return state
 
 
+# ─── CRUNCH ARCADE (WooCommerce Store API) ────────────────────────────────────
+# cruncharcade.com is a WooCommerce UAE store (AED). Its WooCommerce Blocks REST
+# API (/wp-json/wc/store/v1/products) is open (no auth) and returns JSON with
+# name / permalink / prices (minor units) / is_in_stock. We browse the store's
+# own "Pokemon" category (id 121) as the authoritative source and supplement
+# with keyword searches for products filed elsewhere.
+
+CRUNCH_BASE     = "https://cruncharcade.com"
+CRUNCH_API      = f"{CRUNCH_BASE}/wp-json/wc/store/v1/products"
+CRUNCH_CATEGORY = 121                       # the store's "Pokemon" category
+CRUNCH_SEARCH_TERMS = ("pokemon", "pokémon", "mega evolution", "30th celebration")
+
+
+def _crunch_from_product(p: dict) -> dict:
+    prices = p.get("prices") or {}
+    pr = prices.get("price")
+    price = "N/A"
+    if pr:
+        try:
+            minor = int(prices.get("currency_minor_unit", 2))
+            price = f"AED {float(pr) / (10 ** minor):.2f}"
+        except Exception:
+            price = "N/A"
+    return {
+        "title":      p.get("name") or "",
+        "url":        p.get("permalink") or f"{CRUNCH_BASE}/product/{p.get('slug')}",
+        "price":      price,
+        "available":  bool(p.get("is_in_stock")),
+        "variant_id": None,                 # WooCommerce: no Shopify-style cart permalink
+    }
+
+
+async def check_cruncharcade(state: dict, client: httpx.AsyncClient) -> dict:
+    """Crunch Arcade — WooCommerce Pokemon TCG via the open REST API."""
+    log.info("Checking Crunch Arcade...")
+    current: dict[str, dict] = {}
+    try:
+        await asyncio.sleep(random.uniform(1, 3))
+        prods: dict[int, dict] = {}
+
+        async def _page(url: str) -> list[dict]:
+            r = await _shopify_get(url, referer=f"{CRUNCH_BASE}/", timeout=30, label="Crunch Arcade")
+            if r.status_code != 200:
+                log.warning("Crunch Arcade: HTTP %s for %s", r.status_code, url)
+                return []
+            try:
+                return r.json()
+            except Exception:
+                return []
+
+        async def _collect(urls):
+            for url in urls:
+                n = len(prods)
+                for p in await _page(url):
+                    if title_excluded(p.get("name") or ""):
+                        continue
+                    prods[p.get("id")] = p
+                await asyncio.sleep(random.uniform(0.3, 0.7))
+
+        # 1. the store's own Pokemon category (authoritative)
+        await _collect([f"{CRUNCH_API}?category={CRUNCH_CATEGORY}&per_page=100&page={p}" for p in (1, 2, 3)])
+
+        # 2. keyword supplements — catch items filed outside the Pokemon category
+        await _collect([f"{CRUNCH_API}?search={urllib.parse.quote_plus(t)}&per_page=100&page=1"
+                        for t in CRUNCH_SEARCH_TERMS])
+
+        # Filter: category entries are trusted; keyword extras must look Pokemon/TCG.
+        for pid, p in list(prods.items()):
+            title = p.get("name") or ""
+            if is_pokemon_title(title) or any(h in strip_accents(title) for h in SHOPIFY_TCG_HINTS):
+                current[str(pid)] = _crunch_from_product(p)
+            else:
+                # Keep an entry found via keyword only if it still has a card-signal word
+                if any(h in strip_accents(title) for h in ("mega evolution", "30th", "tcg")):
+                    current[str(pid)] = _crunch_from_product(p)
+
+        if not current:
+            log.warning("Crunch Arcade: no Pokemon products found")
+            return state
+
+        mark_ok(state, "cruncharcade")
+        log.info("Crunch Arcade: %d Pokemon products, %d in stock",
+                 len(current), sum(1 for v in current.values() if v["available"]))
+
+        prev = state.get("cruncharcade") or {}
+        first_run = not prev
+
+        if first_run:
+            in_stock = [v for v in current.values() if v["available"]]
+            lines = [f"<b>🎮 CRUNCH ARCADE — Monitoring Started ({len(current)} products)</b>"]
+            if in_stock:
+                lines.append(f"\n✅ <b>In Stock ({len(in_stock)}):</b>")
+                lines += [fmt_product(v) for v in in_stock[:20]]
+            oos = len(current) - len(in_stock)
+            if oos:
+                lines.append(f"\n❌ Out of stock: {oos}")
+            await send_telegram("\n".join(lines), client)
+            log.info("Crunch Arcade: baseline sent (%d products)", len(current))
+        else:
+            new_products, restocked, went_oos = [], [], []
+            for pid, pd in current.items():
+                if pid not in prev:
+                    new_products.append(pd)
+                elif pd["available"] != prev[pid].get("available"):
+                    (restocked if pd["available"] else went_oos).append(pd)
+            if new_products:
+                new_products.sort(key=lambda v: not v["available"])
+                live = sum(1 for v in new_products if v["available"])
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(new_products) else ""
+                lines = [f"<b>{tag}🆕 CRUNCH ARCADE — {len(new_products)} New Product(s), {live} IN STOCK!</b>"]
+                lines += [fmt_product(v) for v in new_products]
+                await send_telegram("\n".join(lines), client)
+                log_events("cruncharcade", "new", new_products)
+            if restocked:
+                tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(restocked) else ""
+                lines = [f"<b>{tag}🟢 CRUNCH ARCADE — {len(restocked)} Back In Stock!</b>"]
+                lines += [fmt_product(v, "✅") for v in restocked]
+                await send_telegram("\n".join(lines), client)
+                log_events("cruncharcade", "restock", restocked)
+            if went_oos:
+                log.info("Crunch Arcade: %d went OOS (not alerting)", len(went_oos))
+            await alert_price_changes("cruncharcade", "🎮 CRUNCH ARCADE", prev, current, client)
+            if not (new_products or restocked):
+                log.info("Crunch Arcade: no changes")
+
+        state["cruncharcade"] = current
+    except Exception as exc:
+        log.error("Crunch Arcade check failed: %s", exc)
+    return state
+
+
 # ─── LITTLE THINGS ME (Shopify JSON) ─────────────────────────────────────────
 
 LT_SEARCH_EVERY = 5
@@ -5263,6 +5396,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "toybox":               {"label": "🧸 Toybox",                "ok": None, "time": ""},
         "amazon_onepiece":     {"label": "🏴‍☠️ Amazon (OP)",      "ok": None, "time": ""},
         "dabdoob":              {"label": "🧸 Dabdoob",               "ok": None, "time": ""},
+        "cruncharcade":         {"label": "🎮 Crunch Arcade",          "ok": None, "time": ""},
         "legends_onepiece":     {"label": "🏴‍☠️ Legends (OP)",      "ok": None, "time": ""},
         "otakume_onepiece":     {"label": "🏴‍☠️ Otakume (OP)",      "ok": None, "time": ""},
     }
@@ -5272,7 +5406,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     status_msg_id: int | None = state.get("status_msg_id")
 
-    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece", "dabdoob"}
+    HEADLESS_SITES = {"otakume", "virgin_megastore", "virgin_megastore_onepiece", "legends_own_the_game", "colorland_toys", "magrudy", "zgames", "little_things", "little_things_onepiece", "toycorner", "kinokuniya", "elctoys", "virgin_sitemap", "littlethings_backend", "amazon_ae", "pinca", "toybox", "otakume_onepiece", "legends_onepiece", "amazon_onepiece", "dabdoob", "cruncharcade"}
     HEADLESS_SITES |= {sk for sk, _fn, _lbl in LORCANA_CHECKS}
     HEADED_SITES = set()  # empty — Geekay uses its own Chrome instance, not the headed batch
 
@@ -5351,7 +5485,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
 
     # ── Timers ────────────────────────────────────────────────────────────────
     last_otakume = 0.0
-    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = last_onepiece = last_dabdoob = 0.0
+    last_virgin = last_virgin_op = last_legends = last_colorland = last_magrudy = last_zgames = last_geekay = last_little_things = last_little_things_op = last_toycorner = last_kinokuniya = last_kinokuniya_event = last_elctoys = last_kino_discovery = last_virgin_sitemap = last_lt_backend = last_amazon = last_pinca = last_toybox = last_onepiece = last_dabdoob = last_cruncharcade = 0.0
     last_lorcana: dict[str, float] = {}   # per-Lorcana-watcher timers
     lorcana_announced = False             # one-time "Lorcana now live" banner
     last_ctx_refresh = 0.0
@@ -5569,6 +5703,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             if "dabdoob" not in DISABLED_RETAILERS and now - last_dabdoob >= INTERVALS.get("dabdoob", 600):
                 headless_tasks.append(("dabdoob", check_dabdoob(state, client)))
                 last_dabdoob = now
+
+            if "cruncharcade" not in DISABLED_RETAILERS and now - last_cruncharcade >= INTERVALS.get("cruncharcade", 120):
+                headless_tasks.append(("cruncharcade", check_cruncharcade(state, client)))
+                last_cruncharcade = now
 
             if now - last_onepiece >= INTERVALS.get("onepiece", 180):
                 last_onepiece = now
