@@ -1285,6 +1285,10 @@ LT_HDR  = {"Referer": f"{LT_BASE}/", "Accept-Language": "en-US,en;q=0.9"}
 LT_FEED_URL = LT_BASE + "/products.json?limit=50"
 LT_SLOW_INTERVAL = 60
 LT_SLOW_FOR      = 600
+# Impersonation profile for every Shopify curl_cffi session. safari17_0 got
+# 403'd by Shopify's Cloudflare around 3-4 Nov 2026; override via env to swap
+# to a working profile without a code change.
+SHOPIFY_IMPERSONATE = os.environ.get("SHOPIFY_IMPERSONATE", "safari17_0")
 _LT = {"slow_until": 0.0, "cf": None}
 
 
@@ -1306,7 +1310,7 @@ async def _shopify_get(url: str, *, referer: str, timeout: float = 25, label: st
     Returns the curl_cffi Response — callers use .status_code / .content / .text / .json()."""
     if _LT["cf"] is None:
         from curl_cffi.requests import AsyncSession
-        _LT["cf"] = AsyncSession(impersonate="safari17_0")
+        _LT["cf"] = AsyncSession(impersonate=SHOPIFY_IMPERSONATE)
     hdr = {"Referer": referer, "Accept-Language": "en-US,en;q=0.9"}
     r = await _LT["cf"].get(url, headers=hdr, timeout=timeout)
     if r.status_code in (403, 429):
@@ -3351,7 +3355,7 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
 
     try:
         await asyncio.sleep(random.uniform(1, 3))
-        async with AsyncSession(impersonate="safari17_0") as cf:
+        async with AsyncSession(impersonate=SHOPIFY_IMPERSONATE) as cf:
             async def cards(url: str):
                 try:
                     r = await cf.get(url, headers=KINO_HDR, timeout=30)
@@ -3407,8 +3411,11 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                                 found[h] = t
                         await asyncio.sleep(random.uniform(0.4, 0.9))
                     search_ok = search_ok and term_ok
-                if search_ok:
-                    state["_kino_full_at"] = now
+                # Always advance the full-search timer. Retrying every pass (30 s)
+                # on failure hammers the store with 5x403 a minute and drags the
+                # shared IP's reputation down (the 3-4 Nov 2026 regression). A
+                # failed search just waits for the next 30-min slot.
+                state["_kino_full_at"] = now
 
             # A partial baseline would re-announce everything it missed later.
             if not started and not (newest_ok and search_ok):
@@ -3867,7 +3874,7 @@ async def check_kinokuniya_lorcana(state: dict, client: httpx.AsyncClient) -> di
     try:
         await asyncio.sleep(random.uniform(1, 3))
         ok = False
-        async with AsyncSession(impersonate="safari17_0") as cf:
+        async with AsyncSession(impersonate=SHOPIFY_IMPERSONATE) as cf:
             for pg in range(1, 6):
                 r = await cf.get(f"{KINO_BASE}/search?q=lorcana&type=product&page={pg}", headers=KINO_HDR, timeout=30)
                 if r.status_code != 200 or "kinokuniya.ae" not in str(r.url):
@@ -5917,9 +5924,14 @@ class BackoffTransport(httpx.AsyncBaseTransport):
 # boot (recorded in state), uses a plain client WITHOUT the back-off layer so
 # nothing is masked, logs "PROBE" lines, and never alerts. ~25 requests.
 
-PROBE_ID = "2026-10-17-cffi-probe"   # tests curl_cffi safari17_0 against the paused Shopify stores
+PROBE_ID = "2026-11-05-profile-probe"   # sweeps curl_cffi profiles to find one Shopify no longer 403s
 _PROBE_HDRS = ("retry-after", "server", "cf-ray", "cf-mitigated", "cf-cache-status", "x-request-id",
                "shopify-complexity-score", "shopify-complexity-score-v2", "x-dc", "content-type")
+
+# Profiles to sweep (curl_cffi 0.15.0). safari17_0 is the current config and
+# 403s now; we're hunting for a live replacement.
+PROBE_PROFILES = ("safari17_0", "chrome124", "chrome131", "chrome136", "chrome142", "chrome146",
+                  "firefox144", "firefox147", "safari18_0", "safari260", "edge101")
 
 
 async def run_block_probe(state: dict) -> None:
@@ -5927,80 +5939,53 @@ async def run_block_probe(state: dict) -> None:
         return
     state["_probe_done"] = PROBE_ID
     save_state(state)
-    lt   = "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250"
-    kino = "https://kinokuniya.ae/products.json?limit=50"
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
-            async def hit(label: str, url: str) -> int:
-                try:
-                    r = await c.get(url, headers=get_json_headers(), timeout=30)
-                except Exception as exc:
-                    log.info("PROBE %-28s ERR %s", label, type(exc).__name__)
-                    return -1
-                h = {k: r.headers.get(k) for k in _PROBE_HDRS if r.headers.get(k)}
-                body = re.sub(r"\s+", " ", r.text[:400]) if r.status_code != 200 else ""
-                log.info("PROBE %-28s HTTP %s | %s%s", label, r.status_code, json.dumps(h),
-                         f" | body: {body[:220]}" if body else "")
-                if r.status_code == 429:
-                    log.info("PROBE %-28s all header names: %s", label, sorted(r.headers.keys()))
-                return r.status_code
+        from curl_cffi.requests import AsyncSession
 
-            await asyncio.sleep(45)                                  # let the boot burst pass
-            try:
+        await asyncio.sleep(45)                                  # let the boot burst pass
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
                 ip = (await c.get("https://ipinfo.io/json", timeout=20)).json()
-                log.info("PROBE egress: ip=%s org=%s city=%s country=%s", ip.get("ip"), ip.get("org"), ip.get("city"), ip.get("country"))
-            except Exception as exc:
-                log.info("PROBE egress lookup failed: %s", type(exc).__name__)
+                log.info("PROBE egress: ip=%s org=%s city=%s country=%s",
+                         ip.get("ip"), ip.get("org"), ip.get("city"), ip.get("country"))
+        except Exception as exc:
+            log.info("PROBE egress lookup failed: %s", type(exc).__name__)
 
-            # ── step D (run FIRST, clean): curl_cffi safari17_0 ──────────────
-            # The plain-client steps confirmed the block; this tests whether
-            # curl_cffi impersonation (the Kinokuniya transport) gets the SAME
-            # stores through from Railway — the question that decides whether the
-            # Little Things curl_cffi migration can be unpaused. Runs before any
-            # plain-client 429 so nothing is pre-tainted.
-            log.info("PROBE step D: curl_cffi safari17_0 against the paused Shopify stores")
+        # ── multi-profile sweep against the most-blocked endpoint ────────────
+        LT = "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250"
+        HDR = {"Referer": "https://littlethingsme.com/", "Accept-Language": "en-US,en;q=0.9"}
+        log.info("PROBE sweep: %d profiles vs Little Things collection feed", len(PROBE_PROFILES))
+        winners = []
+        for p in PROBE_PROFILES:
             try:
-                from curl_cffi.requests import AsyncSession
-                async with AsyncSession(impersonate="safari17_0") as cf:
-                    async def cffi_hit(label: str, url: str, site: str) -> int:
-                        hdr = {"Referer": f"https://{site}/", "Accept-Language": "en-US,en;q=0.9"}
-                        try:
-                            r = await cf.get(url, headers=hdr, timeout=30)
-                        except Exception as exc:
-                            log.info("PROBE-CFFI %-28s ERR %s", label, type(exc).__name__)
-                            return -1
-                        log.info("PROBE-CFFI %-28s HTTP %s", label, r.status_code)
-                        return r.status_code
-
-                    await cffi_hit("D LT collection feed", "https://littlethingsme.com/collections/pokemon-tcg/products.json?limit=250", "littlethingsme.com")
-                    await asyncio.sleep(3); await cffi_hit("D LT newest feed", "https://littlethingsme.com/products.json?limit=50", "littlethingsme.com")
-                    await asyncio.sleep(3); await cffi_hit("D LT suggest", "https://littlethingsme.com/search/suggest.json?q=pokemon&resources[type]=product&resources[limit]=10", "littlethingsme.com")
-                    await asyncio.sleep(3); await cffi_hit("D Pinca feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250", "pinca.ae")
-                    await asyncio.sleep(3); await cffi_hit("D Toybox feed", "https://toybox.ae/collections/pokemon/products.json?limit=250", "toybox.ae")
-                    await asyncio.sleep(3); await cffi_hit("D Otakume collection", "https://otakume.com/collections/pokemon", "otakume.com")
-                    await asyncio.sleep(3); await cffi_hit("D ELC search", "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product", "elctoys.com")
+                async with AsyncSession(impersonate=p) as cf:
+                    r = await cf.get(LT, headers=HDR, timeout=30)
+                log.info("PROBE-PROFILE %-12s HTTP %s", p, r.status_code)
+                if r.status_code == 200:
+                    winners.append(p)
             except Exception as exc:
-                log.error("PROBE-CFFI failed: %s: %s", type(exc).__name__, exc)
-            log.info("PROBE step A (%s): first request to each store", PROBE_ID)
-            await hit("A LT collection feed", lt)
-            await asyncio.sleep(4); await hit("A Pinca collection feed", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250")
-            await asyncio.sleep(4); await hit("A Toybox collection feed", "https://toybox.ae/collections/pokemon/products.json?limit=250")
-            await asyncio.sleep(4); await hit("A Otakume collection page", "https://otakume.com/collections/pokemon")
-            await asyncio.sleep(4); await hit("A ELC search page", "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product")
-            await asyncio.sleep(4); await hit("A LT sitemap (zero cost)", "https://littlethingsme.com/sitemap.xml")
-            await asyncio.sleep(4); await hit("A Kino feed, plain client", kino)
-            log.info("PROBE step B: Little Things feed, 8 requests 5 s apart")
-            await asyncio.sleep(30)
-            codes = []
-            for i in range(8):
-                codes.append(await hit(f"B LT feed #{i + 1}", lt)); await asyncio.sleep(5)
-            log.info("PROBE step B result: %s", codes)
-            log.info("PROBE step C: after a 60 s rest")
-            await asyncio.sleep(60)
-            await hit("C LT feed after rest", lt)
-            for i in range(3):
-                await asyncio.sleep(5); await hit(f"C Kino feed plain #{i + 1}", kino)
-            log.info("PROBE done")
+                log.info("PROBE-PROFILE %-12s ERR %s", p, type(exc).__name__)
+            await asyncio.sleep(2)
+
+        log.info("PROBE profiles returning 200 on Little Things: %s", winners or "NONE")
+
+        # cross-check the survivors against the rest of the Shopify fleet
+        for p in winners[:3]:
+            try:
+                async with AsyncSession(impersonate=p) as cf:
+                    for label, url, site in (
+                        ("pinca", "https://pinca.ae/collections/pokemon-cards/products.json?limit=250", "pinca.ae"),
+                        ("toybox", "https://toybox.ae/collections/pokemon/products.json?limit=250", "toybox.ae"),
+                        ("elc", "https://elctoys.com/search?q=POKEMON+TCG&options%5Bprefix%5D=last&type=product", "elctoys.com"),
+                        ("otakume", "https://otakume.com/collections/pokemon", "otakume.com"),
+                        ("kino-search", "https://kinokuniya.ae/search?q=pokemon&type=product&page=1", "kinokuniya.ae"),
+                    ):
+                        r = await cf.get(url, headers={"Referer": f"https://{site}/", "Accept-Language": "en-US,en;q=0.9"}, timeout=30)
+                        log.info("PROBE-PROFILE %-12s %-10s HTTP %s", p, label, r.status_code)
+                        await asyncio.sleep(2)
+            except Exception as exc:
+                log.info("PROBE-PROFILE %s cross-check failed: %s", p, type(exc).__name__)
+        log.info("PROBE done")
     except Exception as exc:
         log.error("PROBE failed: %s: %s", type(exc).__name__, exc)
 
