@@ -1318,6 +1318,7 @@ VIRGIN_NEIGHBOUR_RADIUS = 8
 VIRGIN_FRONTIER_SPAN    = 60
 VIRGIN_PROBE_BUDGET     = 200     # code probes per discovery pass (tiny redirect responses)
 VIRGIN_HIDDEN_KEEP_DAYS = 90      # stop re-probing a switched-off code after this
+VIRGIN_CLUSTER_MAX      = 120     # switched-off neighbours of watched codes probed every minute
 _VIRGIN_CODE_RE = re.compile(r"/p/(\d{5,8})(?:[/?#]|$)")
 _VIRGIN_POKEMON_HINTS = ("tcg", "booster", "elite-trainer", "blister", "bundle", "trading-card", "etb",
                          "collection-box", "premium-collection")
@@ -1429,6 +1430,27 @@ async def check_virgin_watch(state: dict, client: httpx.AsyncClient) -> dict:
     meta["pass"] = int(meta.get("pass") or 0) + 1
     full_pass = meta["pass"] % VIRGIN_INSTOCK_RECHECK_EVERY == 1
     async with AsyncSession(impersonate="chrome") as cf:
+        # Switched-off codes next to a watched card product are probed every
+        # minute too (a set's ETB is typically switched on next to its packs, as
+        # 1153551 sits in 1153548-53), so nobody has to supply product codes.
+        # A card page that switches on joins its game's watch right here and is
+        # announced below as newly live.
+        watched_ints = [int(c) for g in VIRGIN_WATCH_GAMES for c in _virgin_game_codes(state, g)]
+        hidden = meta.get("hidden") or {}
+        cluster = [c for c in list(hidden)
+                   if any(abs(int(c) - w) <= VIRGIN_NEIGHBOUR_RADIUS for w in watched_ints)][:VIRGIN_CLUSTER_MAX]
+        for code in cluster:
+            status, url = await _virgin_probe(cf, code)
+            await asyncio.sleep(random.uniform(0.1, 0.25))
+            if status != "live":
+                continue
+            hidden.pop(code, None)
+            game = _virgin_slug_game(url)
+            if game:
+                meta.setdefault("found", {}).setdefault(game, []).append(code)
+                log.info("Virgin watch: switched-off %s code went live — %s", game, url)
+            else:
+                meta.setdefault("other", {})[code] = int(time.time())
         for game, cfg in VIRGIN_WATCH_GAMES.items():
             codes = _virgin_game_codes(state, game)
             if not codes:
@@ -1509,7 +1531,9 @@ async def _virgin_watch_alerts(state, client, game, prev, current, armed) -> Non
             live_now.append(v)
         elif v.get("available") and p and not p.get("available"):
             restocked.append(v)
-    for group, kind in ((live_now, "live"), (restocked, "restock")):
+    live_oos = [v for v in live_now if not v.get("available")]
+    live_now = [v for v in live_now if v.get("available")]
+    for group, kind in ((live_now, "live"), (restocked, "restock"), (live_oos, "live_oos")):
         if not group:
             continue
         hot = any(g.get("available") for g in group)
