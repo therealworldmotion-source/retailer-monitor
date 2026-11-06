@@ -1324,12 +1324,19 @@ _VIRGIN_POKEMON_HINTS = ("tcg", "booster", "elite-trainer", "blister", "bundle",
 _VIRGIN_OP_HINTS = ("card-game", "tcg", "booster", "starter-deck", "double-pack", "trading-card",
                     "ultra-deck", "gift-collection")
 _VIRGIN_OP_SET_RE = re.compile(r"(?:^|-)(?:op|eb|st|prb)-?\d{2}(?:-|$)")
+# Accessories and graded singles sit in the same trading-cards category but are
+# not drops (first discovery pass, 6 Nov 2026, found Ultra Pro albums and PSA slabs).
+_VIRGIN_NOT_SEALED_RE = re.compile(
+    r"ultra-pro|deck-protector|album|playmat|deck-box|portfolio|binder|card-sleeves|"
+    r"(?:^|-)(?:psa|pas|bgs|cgc)-?\d")
 
 
 def _virgin_slug_game(url: str) -> str | None:
     """'pokemon' / 'onepiece' for a Pokemon TCG or One Piece Card Game product URL."""
     s = strip_accents(url.lower())
     slug = s.rsplit("/p/", 1)[0]
+    if _VIRGIN_NOT_SEALED_RE.search(slug.rsplit("/", 1)[-1]):
+        return None
     if ("pokemon" in s or "pok-mon" in s) and any(h in slug for h in _VIRGIN_POKEMON_HINTS):
         return "pokemon"
     if "one-piece" in s and (any(h in slug for h in _VIRGIN_OP_HINTS)
@@ -1403,7 +1410,7 @@ def _is_etb_title(title: str) -> bool:
     return "elite trainer" in t or bool(re.search(r"\betb\b", t))
 
 
-VIRGIN_INSTOCK_RECHECK_EVERY = 3     # passes between page reads of an in-stock, non-hot product
+VIRGIN_INSTOCK_RECHECK_EVERY = 3     # passes between page reads of a non-hot, non-pinned product
 
 
 def _virgin_hot(title: str) -> bool:
@@ -1430,6 +1437,9 @@ async def check_virgin_watch(state: dict, client: httpx.AsyncClient) -> dict:
             current: dict[str, dict] = {}
             for code in codes:
                 was = prev.get(code)
+                if (was and code not in cfg["codes"] and was.get("url")
+                        and "/p/" in was["url"] and not _virgin_slug_game(was["url"])):
+                    continue                              # accessory / graded single: not watched
                 status, url = await _virgin_probe(cf, code)
                 if status is None:
                     if was:
@@ -1442,10 +1452,11 @@ async def check_virgin_watch(state: dict, client: httpx.AsyncClient) -> dict:
                     e.update(available=False, listed=False)
                     current[code] = e
                     continue
-                # Page fetches (~1 MB each) every pass only where a change matters
-                # most: newly live, sold out (waiting for a restock), pinned, or a
-                # hot product. Pages already in stock are re-read every few passes.
-                if (was and was.get("listed") and was.get("available") and not full_pass
+                # Page fetches (~1 MB each) every pass only where speed matters:
+                # newly live, pinned, or a hot product (ETB / 30th / box / bundle /
+                # premium collection). Other live pages are re-read every
+                # VIRGIN_INSTOCK_RECHECK_EVERY passes.
+                if (was and was.get("listed") and not full_pass
                         and code not in cfg["codes"] and not _virgin_hot(was.get("title", ""))):
                     current[code] = was
                     continue
@@ -1457,6 +1468,11 @@ async def check_virgin_watch(state: dict, client: httpx.AsyncClient) -> dict:
                 current[code] = info
                 await asyncio.sleep(random.uniform(0.3, 0.8))
             await _virgin_watch_alerts(state, client, game, prev, current, armed)
+            # discover_virgin_codes may have seeded new codes while this pass ran
+            # (concurrent task): keep them, or the next pass re-announces them as
+            # "newly live" (6 Nov 2026: one 40-item message).
+            for c, v in (state.get(cfg["state_key"]) or {}).items():
+                current.setdefault(c, v)
             state[cfg["state_key"]] = current
 
     if answered:
@@ -1526,6 +1542,14 @@ async def discover_virgin_codes(state: dict, client: httpx.AsyncClient) -> dict:
     other: dict = meta.setdefault("other", {})           # code -> when seen live, not a card product
     now = time.time()
 
+    for g, codes in found_codes.items():
+        st = state.get(VIRGIN_WATCH_GAMES[g]["state_key"]) or {}
+        drop = [c for c in codes if "/p/" in (st.get(c) or {}).get("url", "")
+                and not _virgin_slug_game(st[c]["url"])]
+        for c in drop:
+            codes.remove(c)
+            st.pop(c, None)
+            other[c] = int(now)
     watched = {c for g in VIRGIN_WATCH_GAMES for c in _virgin_game_codes(state, g)}
     known: set[int] = {int(c) for c in watched}
     in_search: set[str] = set()      # already stock-checked by check_virgin_megastore
