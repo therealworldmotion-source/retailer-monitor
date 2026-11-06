@@ -5177,15 +5177,26 @@ async def check_cruncharcade(state: dict, client: httpx.AsyncClient) -> dict:
     try:
         await asyncio.sleep(random.uniform(1, 3))
         prods: dict[int, dict] = {}
+        failed = False      # any request that did not answer: this pass is partial
 
         async def _page(url: str) -> list[dict]:
-            r = await _shopify_get(url, referer=f"{CRUNCH_BASE}/", timeout=30, label="Crunch Arcade")
+            nonlocal failed
+            try:
+                r = await _shopify_get(url, referer=f"{CRUNCH_BASE}/", timeout=30, label="Crunch Arcade")
+            except Exception as exc:
+                log.warning("Crunch Arcade: %s for %s", type(exc).__name__, url)
+                failed = True
+                return []
+            if r.status_code == 400:
+                return []           # WooCommerce: page number past the last page
             if r.status_code != 200:
                 log.warning("Crunch Arcade: HTTP %s for %s", r.status_code, url)
+                failed = True
                 return []
             try:
                 return r.json()
             except Exception:
+                failed = True
                 return []
 
         async def _collect(urls):
@@ -5237,17 +5248,21 @@ async def check_cruncharcade(state: dict, client: httpx.AsyncClient) -> dict:
             await send_telegram("\n".join(lines), client)
             log.info("Crunch Arcade: baseline sent (%d products)", len(current))
         else:
-            new_products, restocked, went_oos = [], [], []
+            # Same rule as every other store: alert only on stock you can buy —
+            # a new product that is in stock, or a known one coming back. New
+            # out-of-stock listings are remembered silently (until 6 Nov 2026
+            # every new listing was listed, and the same 11 re-sent hourly).
+            new_products, restocked, went_oos, new_oos = [], [], [], []
             for pid, pd in current.items():
                 if pid not in prev:
-                    new_products.append(pd)
-                elif pd["available"] != prev[pid].get("available"):
+                    (new_products if pd["available"] else new_oos).append(pd)
+                elif pd["available"] != bool(prev[pid].get("available")):
                     (restocked if pd["available"] else went_oos).append(pd)
+            if new_oos:
+                log.info("Crunch Arcade: %d new listing(s) out of stock (not alerting)", len(new_oos))
             if new_products:
-                new_products.sort(key=lambda v: not v["available"])
-                live = sum(1 for v in new_products if v["available"])
                 tag = "🚨🎉 30th ANNIVERSARY — " if _is_30th(new_products) else ""
-                lines = [f"<b>{tag}🆕 CRUNCH ARCADE — {len(new_products)} New Product(s), {live} IN STOCK!</b>"]
+                lines = [f"<b>{tag}🆕 CRUNCH ARCADE — {len(new_products)} New In-Stock Product(s)!</b>"]
                 lines += [fmt_product(v) for v in new_products]
                 await send_telegram("\n".join(lines), client)
                 log_events("cruncharcade", "new", new_products)
@@ -5263,7 +5278,15 @@ async def check_cruncharcade(state: dict, client: httpx.AsyncClient) -> dict:
             if not (new_products or restocked):
                 log.info("Crunch Arcade: no changes")
 
-        state["cruncharcade"] = current
+        # Keep what a pass did not see: on a partial pass (a request failed)
+        # everything carries forward as it was; on a full pass a product must be
+        # missing twice before it counts as gone (its return in stock then alerts).
+        if failed:
+            log.warning("Crunch Arcade: partial pass — keeping %d unseen product(s)",
+                        sum(1 for k in prev if k not in current))
+            state["cruncharcade"] = {**prev, **current}
+        else:
+            state["cruncharcade"], _ = _age_missing(prev, current)
     except Exception as exc:
         log.error("Crunch Arcade check failed: %s", exc)
     return state
