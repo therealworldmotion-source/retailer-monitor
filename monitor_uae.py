@@ -389,6 +389,8 @@ RETAILER_LABELS = {
     "little_things_onepiece":    "🏴\u200d☠️ Little Things (OP)",
     "elctoys":                   "🧸 ELC Toys",
     "virgin_sitemap":            "🗺️ Virgin Sitemap Watch",
+    "virgin_watch":              "🔎 Virgin Hidden Listings",
+    "virgin_watch_onepiece":     "🏴‍☠️ Virgin Hidden Listings (OP)",
     "littlethings_backend":      "🗺️ Little Things Backend",
     "amazon_ae":                 "📦 Amazon.ae",
     "pinca":                     "🅿️ Pinca",
@@ -1227,6 +1229,11 @@ async def check_virgin_sitemap(state: dict, client: httpx.AsyncClient) -> dict:
 
         log.info("Virgin sitemap: %d URLs total, %d match watch terms", len(all_urls), len(matched))
         mark_ok(state, "virgin_sitemap")
+        # Newest product code in the catalogue: where discover_virgin_codes
+        # starts looking for brand-new pages that are not in the sitemap yet.
+        codes = [int(m.group(1)) for u in all_urls for m in [_VIRGIN_CODE_RE.search(u)] if m]
+        if codes:
+            state.setdefault("_virgin_watch_meta", {})["sitemap_max"] = max(codes)
 
         prev = state.get("virgin_sitemap") or {}
         if not prev:
@@ -1264,6 +1271,336 @@ async def check_virgin_sitemap(state: dict, client: httpx.AsyncClient) -> dict:
     except Exception as exc:
         log.error("Virgin sitemap check failed: %s", exc)
 
+    return state
+
+
+# ─── VIRGIN MEGASTORE — PRODUCT-CODE WATCH (listings hidden from search) ──────
+#
+# 6 Nov 2026: Virgin put the whole ME06 Delta Reign range live (1153548-1153553)
+# without adding it to search or to the product sitemap, so every other Virgin
+# checker was blind and the sleeved boosters sold for hours unannounced. The ETB
+# (1153551) is a product page that is still switched off.
+#
+# Virgin's /en/p/<code> answers a live product with a 301 to its page and a
+# switched-off one with a 302 to the homepage (~40 ms, no body), so watching a
+# code is cheap. Live pages carry schema.org InStock/OutOfStock.
+#
+# check_virgin_watch     every VIRGIN_WATCH_INTERVAL s: pinned + discovered
+#                        codes (Pokemon and One Piece card products); alerts when
+#                        a page goes live or comes into stock.
+# discover_virgin_codes  every VIRGIN_DISCOVER_EVERY s: probes the codes next to
+#                        every known card product (sets are created as a batch of
+#                        consecutive codes), the codes just above the newest seen
+#                        (new products), and every switched-off code on rotation,
+#                        adding any Pokemon / One Piece card page to the watch.
+
+VIRGIN_BASE = "https://www.virginmegastore.ae"
+
+
+def _env_codes(name: str, default: str) -> list[str]:
+    return [c.strip() for c in os.environ.get(name, default).split(",") if c.strip().isdigit()]
+
+
+# Pinned codes per game. state key / meta list / alert label per game:
+VIRGIN_WATCH_GAMES = {
+    "pokemon": {
+        "codes": _env_codes("VIRGIN_WATCH_CODES", "1153548,1153549,1153550,1153551,1153552,1153553"),
+        "state_key": "virgin_watch", "label": "VIRGIN", "icon": "🔎",
+    },
+    "onepiece": {
+        "codes": _env_codes("VIRGIN_WATCH_CODES_OP", ""),
+        "state_key": "virgin_watch_onepiece", "label": "VIRGIN (ONE PIECE)", "icon": "🏴‍☠️",
+    },
+}
+VIRGIN_WATCH_INTERVAL   = 60
+VIRGIN_DISCOVER_EVERY   = 900
+VIRGIN_NEIGHBOUR_RADIUS = 8
+VIRGIN_FRONTIER_SPAN    = 60
+VIRGIN_PROBE_BUDGET     = 200     # code probes per discovery pass (tiny redirect responses)
+VIRGIN_HIDDEN_KEEP_DAYS = 90      # stop re-probing a switched-off code after this
+_VIRGIN_CODE_RE = re.compile(r"/p/(\d{5,8})(?:[/?#]|$)")
+_VIRGIN_POKEMON_HINTS = ("tcg", "booster", "elite-trainer", "blister", "bundle", "trading-card", "etb",
+                         "collection-box", "premium-collection")
+_VIRGIN_OP_HINTS = ("card-game", "tcg", "booster", "starter-deck", "double-pack", "trading-card",
+                    "ultra-deck", "gift-collection")
+_VIRGIN_OP_SET_RE = re.compile(r"(?:^|-)(?:op|eb|st|prb)-?\d{2}(?:-|$)")
+
+
+def _virgin_slug_game(url: str) -> str | None:
+    """'pokemon' / 'onepiece' for a Pokemon TCG or One Piece Card Game product URL."""
+    s = strip_accents(url.lower())
+    slug = s.rsplit("/p/", 1)[0]
+    if ("pokemon" in s or "pok-mon" in s) and any(h in slug for h in _VIRGIN_POKEMON_HINTS):
+        return "pokemon"
+    if "one-piece" in s and (any(h in slug for h in _VIRGIN_OP_HINTS)
+                             or _VIRGIN_OP_SET_RE.search(slug.rsplit("/", 1)[-1])):
+        return "onepiece"
+    return None
+
+
+def _virgin_slug_is_tcg(url: str) -> bool:
+    return _virgin_slug_game(url) == "pokemon"
+
+
+async def _virgin_probe(cf, code: str):
+    """('live', page_url) | ('hidden', None) | (None, None) on error."""
+    try:
+        r = await cf.get(f"{VIRGIN_BASE}/en/p/{code}", allow_redirects=False, timeout=15,
+                         headers={"Referer": f"{VIRGIN_BASE}/en/"})
+    except Exception as exc:
+        log.debug("Virgin watch: probe %s failed: %s", code, exc)
+        return None, None
+    loc = r.headers.get("location") or ""
+    if r.status_code in (301, 302, 303, 307, 308):
+        if "/p/" in loc:
+            return "live", (loc if loc.startswith("http") else VIRGIN_BASE + loc)
+        return "hidden", None
+    if r.status_code == 404:
+        return "hidden", None
+    if r.status_code == 200:
+        return "live", f"{VIRGIN_BASE}/en/p/{code}"
+    return None, None
+
+
+async def _virgin_product(cf, code: str, url: str) -> dict | None:
+    import html as _html
+    try:
+        r = await cf.get(url, timeout=30, headers={"Referer": f"{VIRGIN_BASE}/en/"})
+    except Exception as exc:
+        log.debug("Virgin watch: page %s failed: %s", code, exc)
+        return None
+    if r.status_code != 200:
+        return None
+    h = r.text
+    if "schema.org/InStock" not in h and "schema.org/OutOfStock" not in h:
+        return None                                   # not a product page (challenge / error)
+    m = re.search(r"<title>\s*(?:Shop for\s+)?(.*?)\s*\|\s*Virgin Megastore", h, re.S)
+    title = _html.unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else _slug_title(url)
+    pm = re.search(r'"price"\s*:\s*"?([\d.,]+)', h)
+    price = re.sub(r"\.0+$", "", pm.group(1)) if pm else ""
+    return {
+        "title":     title,
+        "url":       str(r.url) if "/p/" in str(r.url) else url,
+        "price":     f"AED {price}" if price else "N/A",
+        "available": "schema.org/InStock" in h and 'id="addToCartButton"' in h,
+        "listed":    True,
+        "code":      code,
+    }
+
+
+def _virgin_game_codes(state: dict, game: str) -> list[str]:
+    found = ((state.get("_virgin_watch_meta") or {}).get("found") or {}).get(game) or []
+    seen, out = set(), []
+    for c in VIRGIN_WATCH_GAMES[game]["codes"] + list(found):
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _is_etb_title(title: str) -> bool:
+    t = strip_accents(title)
+    return "elite trainer" in t or bool(re.search(r"\betb\b", t))
+
+
+VIRGIN_INSTOCK_RECHECK_EVERY = 3     # passes between page reads of an in-stock, non-hot product
+
+
+def _virgin_hot(title: str) -> bool:
+    t = strip_accents(title)
+    return (_is_etb_title(title) or "30th" in t or "booster box" in t or "sealed box" in t
+            or "booster bundle" in t or "premium collection" in t)
+
+
+async def check_virgin_watch(state: dict, client: httpx.AsyncClient) -> dict:
+    from curl_cffi.requests import AsyncSession
+    meta = state.setdefault("_virgin_watch_meta", {})
+    armed = meta.setdefault("armed", {})
+    if not isinstance(armed, dict):
+        armed = meta["armed"] = {}
+    answered = 0
+    meta["pass"] = int(meta.get("pass") or 0) + 1
+    full_pass = meta["pass"] % VIRGIN_INSTOCK_RECHECK_EVERY == 1
+    async with AsyncSession(impersonate="chrome") as cf:
+        for game, cfg in VIRGIN_WATCH_GAMES.items():
+            codes = _virgin_game_codes(state, game)
+            if not codes:
+                continue
+            prev = state.get(cfg["state_key"]) or {}
+            current: dict[str, dict] = {}
+            for code in codes:
+                was = prev.get(code)
+                status, url = await _virgin_probe(cf, code)
+                if status is None:
+                    if was:
+                        current[code] = was              # transient: keep what we knew
+                    continue
+                answered += 1
+                if status == "hidden":
+                    e = dict(was) if was else {"title": f"Virgin product {code} (switched off)",
+                                               "url": f"{VIRGIN_BASE}/en/p/{code}", "price": "N/A", "code": code}
+                    e.update(available=False, listed=False)
+                    current[code] = e
+                    continue
+                # Page fetches (~1 MB each) every pass only where a change matters
+                # most: newly live, sold out (waiting for a restock), pinned, or a
+                # hot product. Pages already in stock are re-read every few passes.
+                if (was and was.get("listed") and was.get("available") and not full_pass
+                        and code not in cfg["codes"] and not _virgin_hot(was.get("title", ""))):
+                    current[code] = was
+                    continue
+                info = await _virgin_product(cf, code, url)
+                if info is None:
+                    if was:
+                        current[code] = was
+                    continue
+                current[code] = info
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            await _virgin_watch_alerts(state, client, game, prev, current, armed)
+            state[cfg["state_key"]] = current
+
+    if answered:
+        mark_ok(state, "virgin_watch")
+    else:
+        log.warning("Virgin watch: no code answered — skipping pass")
+    return state
+
+
+async def _virgin_watch_alerts(state, client, game, prev, current, armed) -> None:
+    cfg = VIRGIN_WATCH_GAMES[game]
+    n_live = sum(1 for v in current.values() if v.get("listed"))
+    n_in = sum(1 for v in current.values() if v.get("available"))
+    log.info("Virgin watch (%s): %d code(s), %d live, %d in stock", game, len(current), n_live, n_in)
+    if not armed.get(game):
+        in_stock = [v for v in current.values() if v.get("available")]
+        hidden = [v for v in current.values() if not v.get("listed")]
+        lines = [f"<b>{cfg['icon']} {cfg['label']} HIDDEN-LISTING WATCH — armed ({len(current)} product codes)</b>",
+                 "<i>Virgin sells some card products on pages that are not in its search. "
+                 "These codes are now checked every minute.</i>"]
+        if in_stock:
+            lines.append(f"\n✅ <b>In stock now ({len(in_stock)}):</b>")
+            lines += [fmt_product(v) for v in in_stock]
+        if hidden:
+            lines.append("\n🙈 Switched off (alert the moment they go live): "
+                         + ", ".join(v["code"] for v in hidden))
+        await send_telegram("\n".join(lines), client)
+        armed[game] = True
+        return
+    live_now, restocked = [], []
+    for code, v in current.items():
+        p = prev.get(code)
+        if v.get("listed") and (p is None or not p.get("listed")):
+            live_now.append(v)
+        elif v.get("available") and p and not p.get("available"):
+            restocked.append(v)
+    for group, kind in ((live_now, "live"), (restocked, "restock")):
+        if not group:
+            continue
+        hot = any(g.get("available") for g in group)
+        etb = game == "pokemon" and any(_is_etb_title(g.get("title", "")) and g.get("available") for g in group)
+        if etb:
+            head = f"🚨🚨🚨 {cfg['label']} — ELITE TRAINER BOX IN STOCK"
+        elif hot:
+            head = f"🚨 {cfg['label']} — HIDDEN LISTING " + ("LIVE & IN STOCK" if kind == "live" else "IN STOCK")
+        else:
+            head = f"👀 {cfg['label']} — hidden listing now live (out of stock)"
+        lines = [f"<b>{head}</b>", "<i>Not in Virgin's search — direct link only.</i>"]
+        lines += [fmt_product(g) for g in group]
+        await send_telegram("\n".join(lines), client)
+        log_events(cfg["state_key"], kind, group)
+    if not (live_now or restocked):
+        log.info("Virgin watch (%s): no changes", game)
+
+
+async def discover_virgin_codes(state: dict, client: httpx.AsyncClient) -> dict:
+    """Find Pokemon / One Piece card product codes missing from Virgin's search.
+
+    Each pass probes, within VIRGIN_PROBE_BUDGET: (1) every code within
+    VIRGIN_NEIGHBOUR_RADIUS of a known card product code, (2) the codes just
+    above the newest one seen, (3) the switched-off codes probed longest ago, so
+    every hidden code is revisited on rotation until it goes live."""
+    from curl_cffi.requests import AsyncSession
+    meta = state.setdefault("_virgin_watch_meta", {})
+    found_codes: dict = meta.setdefault("found", {})     # game -> codes added to the 1-min watch
+    hidden: dict = meta.setdefault("hidden", {})         # code -> [first seen off, last probed]
+    other: dict = meta.setdefault("other", {})           # code -> when seen live, not a card product
+    now = time.time()
+
+    watched = {c for g in VIRGIN_WATCH_GAMES for c in _virgin_game_codes(state, g)}
+    known: set[int] = {int(c) for c in watched}
+    in_search: set[str] = set()      # already stock-checked by check_virgin_megastore
+    for key in ("virgin_sitemap", "virgin_megastore", "virgin_megastore_onepiece"):
+        for k, v in (state.get(key) or {}).items():
+            u = (v.get("url", "") if isinstance(v, dict) else "") or k
+            m = _VIRGIN_CODE_RE.search(u)
+            if m and _virgin_slug_game(u):
+                known.add(int(m.group(1)))
+            if m and key != "virgin_sitemap":
+                in_search.add(m.group(1))
+    newest = max([int(meta.get("frontier") or 0), int(meta.get("sitemap_max") or 0)] + list(known))
+
+    for c in [c for c, (first, _) in hidden.items() if now - float(first) > VIRGIN_HIDDEN_KEEP_DAYS * 86400]:
+        del hidden[c]
+    if len(other) > 20000:                               # keep the newest codes only
+        for c in sorted(other, key=int)[:-20000]:
+            del other[c]
+
+    todo: list[str] = []
+    seen: set[int] = set()
+    def add(codes) -> None:
+        for c in codes:
+            if len(todo) >= VIRGIN_PROBE_BUDGET:
+                return
+            s = str(c)
+            if c > 0 and c not in seen and s not in other and s not in watched and s not in in_search:
+                seen.add(c)
+                todo.append(s)
+    for k in sorted(known, reverse=True):
+        add(range(k - VIRGIN_NEIGHBOUR_RADIUS, k + VIRGIN_NEIGHBOUR_RADIUS + 1))
+    add(range(newest + 1, newest + VIRGIN_FRONTIER_SPAN + 1))
+    add(int(c) for c in sorted(hidden, key=lambda c: hidden[c][1]))   # longest-unprobed first
+
+    found, probed = [], 0
+    async with AsyncSession(impersonate="chrome") as cf:
+        for code in todo:
+            status, url = await _virgin_probe(cf, code)
+            await asyncio.sleep(random.uniform(0.25, 0.5))
+            if status is None:
+                continue
+            probed += 1
+            if status == "hidden":
+                hidden[code] = [hidden.get(code, [now])[0], now]
+                continue
+            hidden.pop(code, None)
+            meta["frontier"] = max(int(meta.get("frontier") or 0), int(code))
+            game = _virgin_slug_game(url)
+            if game:
+                found_codes.setdefault(game, []).append(code)
+                item = {"title": _slug_title(url), "url": url, "price": "N/A",
+                        "available": False, "listed": True, "code": code}
+                # Seed the watch as live-but-unread: the next watch pass reads the
+                # page and alerts only if it is in stock (no "now live" double-up).
+                state.setdefault(VIRGIN_WATCH_GAMES[game]["state_key"], {})[code] = item
+                found.append((game, item))
+                log.info("Virgin discovery: %s page not in search — %s", game, url)
+            else:
+                other[code] = int(now)
+    log.info("Virgin discovery: probed %d/%d codes (newest %d), %d switched off, %d new card code(s)",
+             probed, len(todo), newest, len(hidden), len(found))
+    for game in VIRGIN_WATCH_GAMES:
+        items = [f for g, f in found if g == game]
+        if not items:
+            continue
+        cfg = VIRGIN_WATCH_GAMES[game]
+        log_events(cfg["state_key"], "discovered", items)
+        hot = [f for f in items if _virgin_hot(f["title"])]
+        if hot:
+            await send_telegram(
+                f"<b>{cfg['icon']} {cfg['label']} — hidden page(s) found (not in Virgin's search)</b>\n"
+                "<i>Watched every minute from now; you'll get an alert the moment one is in stock.</i>\n"
+                + "\n".join(f'  👀 <a href="{f["url"]}">{f["title"]}</a>' for f in hot),
+                client,
+            )
     return state
 
 
@@ -3580,7 +3917,11 @@ async def check_kinokuniya(state: dict, client: httpx.AsyncClient) -> dict:
                             fresh = age.days <= KINO_NEW_MAX_AGE_DAYS
                         except Exception:
                             pass
-                    if fresh:
+                    # An older listing first seen now is usually a baseline gap,
+                    # BUT one that is in stock is always announced: on 4 Nov 2026
+                    # the monitor was stopped while the Delta Reign ETB went live,
+                    # and on restart this rule absorbed it silently.
+                    if fresh or v["available"]:
                         new_products.append(v)
                         log.info("Kinokuniya: NEW (%s) — %s",
                                  "in stock" if v["available"] else "out of stock", v["title"])
@@ -5479,6 +5820,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         "kinokuniya":           {"label": "📚 Kinokuniya",            "ok": None, "time": ""},
         "elctoys":              {"label": "🧸 ELC Toys",              "ok": None, "time": ""},
         "virgin_sitemap":       {"label": "🗺️ Virgin Sitemap Watch",  "ok": None, "time": ""},
+        "virgin_watch":         {"label": "🔎 Virgin Hidden Listings", "ok": None, "time": ""},
         "littlethings_backend": {"label": "🗺️ Little Things Backend", "ok": None, "time": ""},
         "amazon_ae":            {"label": "📦 Amazon.ae",             "ok": None, "time": ""},
         "pinca":                {"label": "🅿️ Pinca",                 "ok": None, "time": ""},
@@ -5676,6 +6018,44 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
             await asyncio.sleep(max(5.0, _kino_interval() - (time.monotonic() - t0)))
 
     kino_task = asyncio.create_task(_kinokuniya_loop())
+
+    # ── Virgin hidden-listing watch: its own 60 s loop + a slower discovery loop
+    # (discovery takes ~1-2 min of paced probes; it must not delay the watch).
+    async def _virgin_watch_loop() -> None:
+        nonlocal state
+        while True:
+            t0 = time.monotonic()
+            try:
+                if "virgin_watch" not in DISABLED_RETAILERS:
+                    state = await check_virgin_watch(state, client)
+                    ok = not check_is_stale(state, "virgin_watch", VIRGIN_WATCH_INTERVAL)
+                    _mark("virgin_watch", ok)
+                    if ok:
+                        _track_success("virgin_watch")
+                    save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Virgin watch loop error: %s", exc)
+            await asyncio.sleep(max(5.0, VIRGIN_WATCH_INTERVAL - (time.monotonic() - t0)))
+
+    async def _virgin_discover_loop() -> None:
+        nonlocal state
+        await asyncio.sleep(90)                  # let the boot burst and first watch pass finish
+        while True:
+            t0 = time.monotonic()
+            try:
+                if "virgin_watch" not in DISABLED_RETAILERS:
+                    state = await discover_virgin_codes(state, client)
+                    save_state(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Virgin discovery loop error: %s", exc)
+            await asyncio.sleep(max(60.0, VIRGIN_DISCOVER_EVERY - (time.monotonic() - t0)))
+
+    virgin_watch_task = asyncio.create_task(_virgin_watch_loop())
+    virgin_discover_task = asyncio.create_task(_virgin_discover_loop())
     probe_task = asyncio.create_task(run_block_probe(state))   # one-off diagnostic, see PROBE_ID
 
     # ── 30th Elite Trainer Box alarm: repeats until "ok" or sold out ──────────
@@ -5887,6 +6267,8 @@ async def monitor_loop(client: httpx.AsyncClient, browser, headless_browser, pw)
         kino_task.cancel()
         probe_task.cancel()
         etb_task.cancel()
+        virgin_watch_task.cancel()
+        virgin_discover_task.cancel()
         try:
             await headless_context.close()
         except Exception:
